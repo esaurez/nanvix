@@ -310,60 +310,101 @@ impl VirtMemoryManager {
             Ok(page_table)
         };
 
-        let uframes: Vec<UserFrame> = match self.physman.try_borrow_mut() {
-            Ok(mut physman) => physman.alloc_many_user_frames(nframes)?,
-            Err(_) => {
-                let reason: &str = "failed to borrow physical memory manager";
-                error!("{reason}");
-                return Err(Error::new(ErrorCode::ResourceBusy, reason));
-            },
-        };
+        // Process frames in chunks to bound kernel heap usage.  Each chunk
+        // allocates a small Vec that is dropped before the next chunk begins,
+        // preventing large batch requests from exhausting the kernel slab.
+        const MAX_CHUNK: usize = 32;
 
         let start_vaddr: PageAligned<VirtualAddress> = vaddr;
-        let mut mapped_count: usize = 0;
-        let mut map_error: Result<(), Error> = Ok(());
+        let mut total_mapped: usize = 0;
+        let mut remaining: usize = nframes;
 
-        for uframe in uframes {
-            if let Err(e) = vmem.map(uframe, vaddr, access, &page_table_allocator) {
-                map_error = Err(e);
-                break;
-            }
-            mapped_count += 1;
-            if clear {
-                if let Err(e) = vmem.memset(vaddr, 0) {
-                    map_error = Err(e);
-                    break;
-                }
-            }
-            match PageAligned::from_raw_value(vaddr.into_raw_value() + mem::PAGE_SIZE) {
-                Ok(next) => vaddr = next,
+        while remaining > 0 {
+            let chunk_size: usize = core::cmp::min(remaining, MAX_CHUNK);
+
+            let alloc_result = self
+                .physman
+                .try_borrow_mut()
+                .map_err(|_| {
+                    Error::new(
+                        ErrorCode::ResourceBusy,
+                        "failed to borrow physical memory manager",
+                    )
+                })
+                .and_then(|mut physman| physman.alloc_many_user_frames(chunk_size));
+
+            let uframes: Vec<UserFrame> = match alloc_result {
+                Ok(frames) => frames,
                 Err(e) => {
-                    map_error = Err(e);
-                    break;
+                    error!("alloc_upages(): frame allocation failed ({e:?})");
+                    self.rollback_mapped_pages(vmem, start_vaddr, total_mapped);
+                    return Err(e);
                 },
-            }
-        }
+            };
 
-        if let Err(e) = map_error {
-            // Rollback: unmap all pages that were successfully mapped.
-            let mut rollback_addr: PageAligned<VirtualAddress> = start_vaddr;
-            for _ in 0..mapped_count {
-                if let Err(re) = self.try_unmap_upage(vmem, rollback_addr) {
-                    warn!(
-                        "alloc_upages(): rollback failed (vaddr={rollback_addr:?}, error={re:?})"
-                    );
+            let mut uframes_iter = uframes.into_iter();
+            for uframe in uframes_iter.by_ref() {
+                if let Err(e) = vmem.map(uframe, vaddr, access, &page_table_allocator) {
+                    // Free remaining unprocessed frames to avoid leaking them.
+                    self.free_remaining_frames(uframes_iter);
+                    self.rollback_mapped_pages(vmem, start_vaddr, total_mapped);
+                    return Err(e);
                 }
-                rollback_addr = match PageAligned::from_raw_value(
-                    rollback_addr.into_raw_value() + mem::PAGE_SIZE,
-                ) {
-                    Ok(next) => next,
-                    Err(_) => break,
-                };
+                total_mapped += 1;
+                if clear {
+                    if let Err(e) = vmem.memset(vaddr, 0) {
+                        self.free_remaining_frames(uframes_iter);
+                        self.rollback_mapped_pages(vmem, start_vaddr, total_mapped);
+                        return Err(e);
+                    }
+                }
+                match PageAligned::from_raw_value(vaddr.into_raw_value() + mem::PAGE_SIZE) {
+                    Ok(next) => vaddr = next,
+                    Err(e) => {
+                        self.free_remaining_frames(uframes_iter);
+                        self.rollback_mapped_pages(vmem, start_vaddr, total_mapped);
+                        return Err(e);
+                    },
+                }
             }
-            return Err(e);
+            // Vec is dropped here, freeing kernel heap before the next chunk.
+
+            remaining -= chunk_size;
         }
 
         Ok(())
+    }
+
+    /// Rollback helper: unmap pages that were successfully mapped starting from
+    /// `start_vaddr` for `count` pages.
+    fn rollback_mapped_pages(
+        &mut self,
+        vmem: &mut Vmem,
+        start_vaddr: PageAligned<VirtualAddress>,
+        count: usize,
+    ) {
+        let mut addr: PageAligned<VirtualAddress> = start_vaddr;
+        for _ in 0..count {
+            if let Err(re) = self.try_unmap_upage(vmem, addr) {
+                warn!("alloc_upages(): rollback failed (vaddr={addr:?}, error={re:?})");
+            }
+            addr = match PageAligned::from_raw_value(addr.into_raw_value() + mem::PAGE_SIZE) {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+        }
+    }
+
+    /// Free frames that were allocated but not yet mapped, to avoid resource leaks
+    /// when a map or memset operation fails mid-chunk.
+    fn free_remaining_frames(&mut self, remaining: impl Iterator<Item = UserFrame>) {
+        if let Ok(mut physman) = self.physman.try_borrow_mut() {
+            for frame in remaining {
+                if let Err(fe) = physman.free_user_frame(frame) {
+                    warn!("alloc_upages(): failed to free remaining frame (error={fe:?})");
+                }
+            }
+        }
     }
 
     ///
