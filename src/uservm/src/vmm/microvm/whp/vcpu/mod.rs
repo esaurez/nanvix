@@ -520,6 +520,20 @@ impl VirtualProcessor {
         Ok(unsafe { values[0].Reg64 })
     }
 
+    /// Reads guest RIP, RBP, and CR3 for stack profiling.
+    pub fn get_profile_regs(&self) -> Result<(u32, u32, u32)> {
+        const REG_RIP: WHV_REGISTER_NAME = WHV_REGISTER_NAME(0x10);
+        const REG_RBP: WHV_REGISTER_NAME = WHV_REGISTER_NAME(0x05);
+        const REG_CR3: WHV_REGISTER_NAME = WHV_REGISTER_NAME(0x1E);
+        let names: [WHV_REGISTER_NAME; 3] = [REG_RIP, REG_RBP, REG_CR3];
+        let mut values: [WHV_REGISTER_VALUE; 3] = [unsafe { mem::zeroed() }; 3];
+        unsafe {
+            whp_get_registers(self.partition, self.index, &names, &mut values)
+                .map_err(|e| anyhow::anyhow!("failed to get profile regs (error={e:?})"))?;
+        }
+        Ok(unsafe { (values[0].Reg64 as u32, values[1].Reg64 as u32, values[2].Reg64 as u32) })
+    }
+
     /// Sets the RIP register to the given value.
     pub fn set_rip(&mut self, rip: u64) -> Result<()> {
         let names: [WHV_REGISTER_NAME; 1] = [WHV_X64_REGISTER_RIP];

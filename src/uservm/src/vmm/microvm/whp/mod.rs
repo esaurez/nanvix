@@ -339,6 +339,8 @@ pub struct Vmm {
     /// Performance timings collector for fine-grained startup breakdown.
     #[cfg(feature = "profile-time")]
     perf_timings: PerfTimings,
+    /// Guest stack profiler (active when guest_profile_path is set).
+    guest_profiler: Option<Arc<std::sync::Mutex<Vec<crate::guest_profiler::StackSample>>>>,
 }
 
 ///
@@ -554,6 +556,7 @@ impl Vmm {
             })),
             #[cfg(feature = "profile-time")]
             perf_timings,
+            guest_profiler: None,
         })
     }
 
@@ -623,6 +626,12 @@ impl Vmm {
         // providing pvclock updates once user-space is running.
         let mut timer_started: bool = false;
 
+        // Guest profiler: start a dedicated cancel timer for periodic sampling.
+        // Deferred slightly to avoid interfering with the first VP entry.
+        let mut profiler_timer: Option<timer::Timer> = None;
+        let mut profiler_timer_started: bool = false;
+        let mut exit_count: u64 = 0;
+
         // PIT channel 2 state for LAPIC timer calibration. The guest
         // programs PIT ch2 in one-shot mode and polls port 0x61 bit 5
         // to detect when the countdown expires.
@@ -657,7 +666,16 @@ impl Vmm {
             // Consume pending IKC notification.  to prevent re-delivery on the next loop iteration.
             let _ = self.ikc_notifier.take_pending();
 
-            let exit_context = {
+            // Start profiler cancel timer after a few exits to avoid the first-entry cost.
+            exit_count += 1;
+            if self.guest_profiler.is_some() && !profiler_timer_started && exit_count > 5 {
+                let mut t = timer::Timer::new(self.partition_handle);
+                t.start(1000); // 1ms = 1kHz sampling
+                profiler_timer = Some(t);
+                profiler_timer_started = true;
+            }
+
+            let (exit_context, profile_regs) = {
                 let mut locked_vcpu: MutexGuard<'_, VirtualProcessor> = self.vcpu.blocking_lock();
                 // Exit if the vCPU is no longer online.
                 if !locked_vcpu.is_online() {
@@ -677,8 +695,39 @@ impl Vmm {
                 {
                     guest_time_acc_us += run_start.elapsed().as_micros() as u64;
                 }
-                ctx
+
+                // Guest profiler: read registers on Interrupted exits (from our timer).
+                let regs = if self.guest_profiler.is_some()
+                    && profiler_timer_started
+                    && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
+                {
+                    locked_vcpu.get_profile_regs().ok()
+                } else {
+                    None
+                };
+
+                (ctx, regs)
             };
+
+            // Guest profiler: capture sample after vcpu lock is released.
+            //
+            // Safety: The vCPU is stopped at this point — WHvRunVirtualProcessor
+            // returned with an Interrupted exit, and the next run() call hasn't
+            // been issued yet. Guest memory (page tables, stack) cannot change
+            // while the vCPU is not executing, so reading vmem here is safe.
+            if let (Some(profiler_samples), Some((eip, ebp, cr3))) =
+                (&self.guest_profiler, profile_regs)
+            {
+                let vmem_guard = self.vmem.blocking_lock();
+                crate::guest_profiler::GuestProfiler::capture_sample(
+                    profiler_samples,
+                    vmem_guard.get_raw_ptr(),
+                    vmem_guard.get_size(),
+                    eip,
+                    ebp,
+                    cr3,
+                );
+            }
 
             // Parse exit reason.
             match exit_context.reason_ref() {
@@ -850,6 +899,11 @@ impl Vmm {
 
         self.timer.lock().unwrap().stop();
 
+        // Stop profiler timer if running.
+        if let Some(mut t) = profiler_timer.take() {
+            t.stop();
+        }
+
         // Record guest vs exit-handling time breakdown.
         #[cfg(feature = "profile-time")]
         {
@@ -879,6 +933,14 @@ impl Vmm {
     ///
     pub fn guest(&self) -> Arc<Mutex<Guest>> {
         self.guest.clone()
+    }
+
+    /// Enables guest stack profiling. Returns the profiler handle for
+    /// reading samples after VM exit.
+    pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
+        let profiler = crate::guest_profiler::GuestProfiler::new(4096);
+        self.guest_profiler = Some(profiler.handle());
+        profiler
     }
 
     /// Returns a clone of the IKC notifier for use by the memory thread.
