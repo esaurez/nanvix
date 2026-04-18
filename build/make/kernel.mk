@@ -10,6 +10,21 @@ KERNEL_CARGO_FEATURES := $(if $(KERNEL_FEATURES),--features "$(KERNEL_FEATURES)"
 all-kernel: init
 	$(KERNEL_CARGO_BUILD_CMD) $(KERNEL_CARGO_FEATURES) -p kernel
 	$(CP_CMD) $(OBJECTS_DIR)/$(TARGET)-kernel/$(BUILD_MODE)/kernel.elf $(BINARIES_DIR)/kernel.elf
+ifeq ($(PROFILER),yes)
+	# Profiling build: strip .debug_* sections but keep .symtab so the
+	# guest profiler can resolve kernel function names. This reduces the
+	# binary loaded into guest RAM (~1.4 MB savings) while preserving
+	# the ~60 KB symbol table needed for stack-trace resolution.
+	# A full-debug copy is kept as kernel.elf.debug for line-level debugging.
+	$(CP_CMD) $(BINARIES_DIR)/kernel.elf $(BINARIES_DIR)/kernel.elf.debug
+	@if command -v rust-objcopy >/dev/null 2>&1; then \
+		rust-objcopy --strip-debug "$(BINARIES_DIR)/kernel.elf"; \
+	elif command -v objcopy >/dev/null 2>&1; then \
+		objcopy --strip-debug "$(BINARIES_DIR)/kernel.elf"; \
+	else \
+		echo "WARNING: objcopy not found, kernel.elf retains debug sections (~1.4 MB extra)"; \
+	fi
+endif
 
 check-kernel:
 	$(KERNEL_CARGO_CHECK_CMD) $(KERNEL_CARGO_FEATURES) -p kernel
