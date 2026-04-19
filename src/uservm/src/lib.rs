@@ -359,10 +359,11 @@ impl UserVm {
         }
 
         // Enable guest profiler if requested.
-        let guest_profiler = if args_guest_profile_path.is_some() {
-            Some(microvm.enable_guest_profiler())
+        let (guest_profiler, host_samples) = if args_guest_profile_path.is_some() {
+            let (gp, hs) = microvm.enable_guest_profiler();
+            (Some(gp), Some(hs))
         } else {
-            None
+            (None, None)
         };
 
         let vmem: Arc<Mutex<VirtualMemory>> = microvm.vmem();
@@ -472,6 +473,20 @@ impl UserVm {
                 error!("Failed to write guest profile: {e:?}");
             } else {
                 eprintln!("GUEST_PROFILE: wrote {} samples to {}", sample_count, path);
+            }
+
+            // Write host VMM samples (appended to the same folded file).
+            if let Some(ref hs) = host_samples {
+                let host_count = hs.lock().map(|s| s.len()).unwrap_or(0);
+                if host_count > 0 {
+                    match crate::guest_profiler::host::write_host_folded_from_samples(hs, path) {
+                        Ok(()) => eprintln!(
+                            "GUEST_PROFILE: wrote {} host samples to {}",
+                            host_count, path
+                        ),
+                        Err(e) => error!("Failed to write host profile: {e:?}"),
+                    }
+                }
             }
         }
 

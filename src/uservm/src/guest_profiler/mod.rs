@@ -9,6 +9,7 @@
 //! symbol tables and written as folded stacks for flamegraph generation.
 
 mod gva;
+pub mod host;
 mod samples;
 mod symbols;
 

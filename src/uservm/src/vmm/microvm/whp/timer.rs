@@ -84,6 +84,19 @@ impl Timer {
     /// Each tick calls `WHvCancelRunVirtualProcessor` to force a VM exit
     /// so the VMM loop can update pvclock. No guest interrupt is injected.
     pub fn start(&mut self, period_us: u64) {
+        self.start_inner(period_us, None);
+    }
+
+    /// Starts the timer and additionally sets a flag on each tick.
+    ///
+    /// The flag is set to `true` before calling `WHvCancelRunVirtualProcessor`,
+    /// allowing the vCPU thread to distinguish timer-fired-during-exit-handling
+    /// from timer-fired-during-guest-execution.
+    pub fn start_with_flag(&mut self, period_us: u64, flag: Arc<AtomicBool>) {
+        self.start_inner(period_us, Some(flag));
+    }
+
+    fn start_inner(&mut self, period_us: u64, flag: Option<Arc<AtomicBool>>) {
         if self.thread.is_some() {
             return;
         }
@@ -103,6 +116,11 @@ impl Timer {
                 thread::sleep(period);
                 if stop.load(Ordering::Relaxed) {
                     break;
+                }
+                // Set the pending flag before canceling so the vCPU thread
+                // knows a sample was requested.
+                if let Some(ref f) = flag {
+                    f.store(true, Ordering::Release);
                 }
                 // SAFETY: `partition` is a valid WHP partition handle that outlives
                 // the timer thread (the Vmm struct owns both).

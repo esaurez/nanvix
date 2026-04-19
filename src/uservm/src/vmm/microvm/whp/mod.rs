@@ -341,6 +341,8 @@ pub struct Vmm {
     perf_timings: PerfTimings,
     /// Guest stack profiler (active when guest_profile_path is set).
     guest_profiler: Option<Arc<std::sync::Mutex<Vec<crate::guest_profiler::StackSample>>>>,
+    /// Host VMM stack profiler for cooperative self-sampling.
+    host_profiler: Option<Arc<std::sync::Mutex<crate::guest_profiler::host::HostProfiler>>>,
 }
 
 ///
@@ -557,6 +559,7 @@ impl Vmm {
             #[cfg(feature = "profile-time")]
             perf_timings,
             guest_profiler: None,
+            host_profiler: None,
         })
     }
 
@@ -670,12 +673,23 @@ impl Vmm {
             exit_count += 1;
             if self.guest_profiler.is_some() && !profiler_timer_started && exit_count > 5 {
                 let mut t = timer::Timer::new(self.partition_handle);
-                t.start(1000); // 1ms = 1kHz sampling
+                // Pass the host profiler's pending flag so the timer thread
+                // sets it on each tick, allowing deterministic detection of
+                // timer-fired-during-exit-handling vs during-guest-execution.
+                if let Some(ref hp_arc) = self.host_profiler {
+                    if let Ok(hp) = hp_arc.lock() {
+                        t.start_with_flag(1000, hp.pending_flag());
+                    } else {
+                        t.start(1000);
+                    }
+                } else {
+                    t.start(1000); // 1ms = 1kHz sampling
+                }
                 profiler_timer = Some(t);
                 profiler_timer_started = true;
             }
 
-            let (exit_context, profile_regs) = {
+            let (exit_context, profile_regs, host_sample_needed) = {
                 let mut locked_vcpu: MutexGuard<'_, VirtualProcessor> = self.vcpu.blocking_lock();
                 // Exit if the vCPU is no longer online.
                 if !locked_vcpu.is_online() {
@@ -686,6 +700,23 @@ impl Vmm {
                     );
                     break Ok(locked_vcpu.exit_status());
                 }
+
+                // Clear the pending flag just before entering the guest.
+                // After run() returns, we check the flag to determine where
+                // the timer fired:
+                //   - Interrupted + flag NOT set → timer fired during guest
+                //     execution (the cancel caused the interrupt, flag was
+                //     consumed by a previous iteration)
+                //   - Interrupted + flag set → timer fired during guest
+                //     execution (normal case — capture guest stack)
+                //   - Any exit + flag set → timer fired during exit handling
+                //     on this iteration (capture host stack)
+                if let Some(ref hp_arc) = self.host_profiler {
+                    if let Ok(hp) = hp_arc.lock() {
+                        hp.consume_pending();
+                    }
+                }
+
                 #[cfg(feature = "profile-time")]
                 let run_start: Instant = Instant::now();
 
@@ -696,20 +727,41 @@ impl Vmm {
                     guest_time_acc_us += run_start.elapsed().as_micros() as u64;
                 }
 
-                // Guest profiler: read registers on Interrupted exits (from our timer).
-                let regs = if self.guest_profiler.is_some()
-                    && profiler_timer_started
-                    && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
-                {
-                    locked_vcpu.get_profile_regs().ok()
+                // Check if the timer fired AFTER we entered run().
+                let flag_set_after_run = if let Some(ref hp_arc) = self.host_profiler {
+                    hp_arc
+                        .lock()
+                        .map(|hp| hp.consume_pending())
+                        .unwrap_or(false)
                 } else {
-                    None
+                    false
                 };
 
-                (ctx, regs)
+                let is_interrupted =
+                    matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted);
+
+                // Determine sample type:
+                // - Interrupted exit: the timer canceled the VP while it was
+                //   executing guest code → capture guest registers.
+                // - Non-interrupted exit with flag set: the timer fired while
+                //   we were handling a previous exit (between run() calls),
+                //   then the VP exited for a different reason → capture host.
+                let regs =
+                    if self.guest_profiler.is_some() && profiler_timer_started && is_interrupted {
+                        locked_vcpu.get_profile_regs().ok()
+                    } else {
+                        None
+                    };
+
+                let host_needed = self.host_profiler.is_some()
+                    && profiler_timer_started
+                    && flag_set_after_run
+                    && !is_interrupted;
+
+                (ctx, regs, host_needed)
             };
 
-            // Guest profiler: capture sample after vcpu lock is released.
+            // Guest profiler: capture guest sample after vcpu lock is released.
             //
             // Safety: The vCPU is stopped at this point — WHvRunVirtualProcessor
             // returned with an Interrupted exit, and the next run() call hasn't
@@ -727,6 +779,17 @@ impl Vmm {
                     ebp,
                     cr3,
                 );
+            }
+
+            // Host profiler: capture host stack when the timer fired during
+            // exit handling (flag was set but the exit wasn't Interrupted,
+            // meaning the timer fired between run() calls).
+            if host_sample_needed {
+                if let Some(ref hp_arc) = self.host_profiler {
+                    if let Ok(hp) = hp_arc.lock() {
+                        hp.capture("exit_handling");
+                    }
+                }
             }
 
             // Parse exit reason.
@@ -935,12 +998,22 @@ impl Vmm {
         self.guest.clone()
     }
 
-    /// Enables guest stack profiling. Returns the profiler handle for
+    /// Enables guest and host stack profiling. Returns profiler handles for
     /// reading samples after VM exit.
-    pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
-        let profiler = crate::guest_profiler::GuestProfiler::new(4096);
-        self.guest_profiler = Some(profiler.handle());
-        profiler
+    pub fn enable_guest_profiler(
+        &mut self,
+    ) -> (
+        crate::guest_profiler::GuestProfiler,
+        Arc<std::sync::Mutex<Vec<crate::guest_profiler::host::HostStackSample>>>,
+    ) {
+        let guest_profiler = crate::guest_profiler::GuestProfiler::new(4096);
+        self.guest_profiler = Some(guest_profiler.handle());
+
+        let host_profiler = crate::guest_profiler::host::HostProfiler::new(4096);
+        let host_samples = host_profiler.samples_handle();
+        self.host_profiler = Some(Arc::new(std::sync::Mutex::new(host_profiler)));
+
+        (guest_profiler, host_samples)
     }
 
     /// Returns a clone of the IKC notifier for use by the memory thread.
