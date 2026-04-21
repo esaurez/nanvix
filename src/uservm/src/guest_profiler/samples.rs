@@ -9,6 +9,57 @@ use std::sync::{
     Mutex,
 };
 
+/// Returns a high-resolution timestamp for sample correlation.
+///
+/// On Windows: QPC (QueryPerformanceCounter) — same time source as ETW.
+/// On Linux: `clock_gettime(CLOCK_MONOTONIC_RAW)` — same time source as `perf`.
+#[inline]
+pub fn timestamp_now() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe extern "system" {
+            fn QueryPerformanceCounter(counter: *mut i64) -> i32;
+        }
+        let mut counter: i64 = 0;
+        unsafe {
+            QueryPerformanceCounter(&mut counter);
+        }
+        counter as u64
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts);
+        }
+        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+    }
+}
+
+/// Returns the timestamp frequency (ticks per second).
+///
+/// On Windows: QPC frequency. On Linux: 1_000_000_000 (nanoseconds).
+pub fn timestamp_frequency() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe extern "system" {
+            fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+        }
+        let mut freq: i64 = 0;
+        unsafe {
+            QueryPerformanceFrequency(&mut freq);
+        }
+        freq as u64
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        1_000_000_000 // nanoseconds
+    }
+}
+
 /// Maximum frame-pointer chain depth per sample.
 const MAX_STACK_DEPTH: usize = 128;
 
@@ -42,6 +93,8 @@ fn is_valid_stack_addr(ebp: u32) -> bool {
 pub struct StackSample {
     /// Return addresses from the frame-pointer chain (deepest first).
     pub addresses: Vec<u32>,
+    /// QPC timestamp when the sample was captured (for ETW correlation).
+    pub qpc_timestamp: u64,
 }
 
 /// Collects guest stack samples from the host side.
@@ -143,7 +196,10 @@ impl GuestProfiler {
 
         if addrs.len() >= 1 {
             if let Ok(mut s) = samples.lock() {
-                s.push(StackSample { addresses: addrs });
+                s.push(StackSample {
+                    addresses: addrs,
+                    qpc_timestamp: timestamp_now(),
+                });
             }
         }
     }

@@ -107,6 +107,7 @@ use ::anyhow::Result;
 use ::log::{
     error,
     trace,
+    warn,
 };
 #[cfg(feature = "profile-time")]
 use ::std::time::Instant;
@@ -365,6 +366,48 @@ impl UserVm {
             None
         };
 
+        // Start host kernel tracing session if profiling is enabled.
+        #[cfg(target_os = "windows")]
+        let mut kernel_session = if args_guest_profile_path.is_some() {
+            let etl_path = format!(
+                "{}.etl",
+                args_guest_profile_path
+                    .as_deref()
+                    .unwrap_or("guest-profile")
+            );
+            let mut session = crate::guest_profiler::etw::EtwSession::new(&etl_path);
+            match session.start() {
+                Ok(()) => Some(session),
+                Err(e) => {
+                    warn!("ETW session failed to start (requires admin): {e}");
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let mut kernel_session = if args_guest_profile_path.is_some() {
+            let perf_path = format!(
+                "{}.perf.data",
+                args_guest_profile_path
+                    .as_deref()
+                    .unwrap_or("guest-profile")
+            );
+            let mut session = crate::guest_profiler::perf_linux::PerfSession::new(&perf_path);
+            match session.start() {
+                Ok(()) => Some(session),
+                Err(e) => {
+                    warn!("perf session failed to start: {e}");
+                    None
+                },
+            }
+        } else {
+            None
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let mut kernel_session: Option<()> = None;
+
         let vmem: Arc<Mutex<VirtualMemory>> = microvm.vmem();
         let guest: Arc<Mutex<Guest>> = microvm.guest();
 
@@ -410,6 +453,17 @@ impl UserVm {
                 anyhow::bail!(reason)
             },
         };
+
+        // Pass the vCPU thread ID to the kernel tracing session for
+        // post-processing correlation (filter ETW/perf samples by TID).
+        #[cfg(target_os = "windows")]
+        if let Some(ref mut session) = kernel_session {
+            session.set_vcpu_thread_id(vcpu_tid);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ref mut session) = kernel_session {
+            session.set_vcpu_thread_id(vcpu_tid);
+        }
 
         let filename: String = args
             .initrd_filename
@@ -472,6 +526,80 @@ impl UserVm {
                 error!("Failed to write guest profile: {e:?}");
             } else {
                 eprintln!("GUEST_PROFILE: wrote {} samples to {}", sample_count, path);
+            }
+
+            // Write timestamp log for kernel trace correlation.
+            let guest_sample_vec = profiler.drain_samples();
+            let ts_freq = crate::guest_profiler::timestamp_frequency();
+            if ts_freq > 0 {
+                let ts_path = format!("{}.timestamps.log", path);
+                #[cfg(target_os = "windows")]
+                let write_result = crate::guest_profiler::etw::write_timestamp_log(
+                    &ts_path,
+                    &guest_sample_vec,
+                    ts_freq,
+                );
+                #[cfg(target_os = "linux")]
+                let write_result = crate::guest_profiler::perf_linux::write_timestamp_log(
+                    &ts_path,
+                    &guest_sample_vec,
+                    ts_freq,
+                );
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                let write_result: std::io::Result<()> = Ok(());
+                match write_result {
+                    Ok(()) => eprintln!("PROFILER: timestamp log at {}", ts_path),
+                    Err(e) => error!("Failed to write timestamp log: {e:?}"),
+                }
+            }
+        }
+
+        // Stop kernel trace session and generate correlation script.
+        if let Some(ref mut session) = kernel_session {
+            #[cfg(target_os = "windows")]
+            {
+                match session.stop() {
+                    Ok(etl_path) => {
+                        if let Some(ref path) = args_guest_profile_path {
+                            let script = crate::guest_profiler::etw::generate_correlation_script(
+                                &etl_path,
+                                path,
+                                session.vcpu_thread_id().unwrap_or(0),
+                                &format!("{}.svg", path),
+                            );
+                            let script_path = format!("{}.correlation.ps1", path);
+                            if let Err(e) = std::fs::write(&script_path, &script) {
+                                error!("Failed to write correlation script: {e:?}");
+                            } else {
+                                eprintln!("PROFILER: correlation script at {}", script_path);
+                            }
+                        }
+                    },
+                    Err(e) => warn!("ETW session stop failed: {e}"),
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                match session.stop() {
+                    Ok(perf_path) => {
+                        if let Some(ref path) = args_guest_profile_path {
+                            let script =
+                                crate::guest_profiler::perf_linux::generate_correlation_script(
+                                    &perf_path,
+                                    path,
+                                    session.vcpu_thread_id().unwrap_or(0),
+                                    &format!("{}.svg", path),
+                                );
+                            let script_path = format!("{}.correlation.sh", path);
+                            if let Err(e) = std::fs::write(&script_path, &script) {
+                                error!("Failed to write correlation script: {e:?}");
+                            } else {
+                                eprintln!("PROFILER: correlation script at {}", script_path);
+                            }
+                        }
+                    },
+                    Err(e) => warn!("perf session stop failed: {e}"),
+                }
             }
         }
 

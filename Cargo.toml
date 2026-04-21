@@ -258,8 +258,34 @@ incremental = false
 codegen-units = 1
 rpath = false
 
-# Profiling build: release performance with symbols and frame pointers.
-# Use: cargo build --profile release-profiling
+# Profiling build: release performance with debug symbols and frame pointers.
+#
+# Activated by: .\z build --profile --release
+# Equivalent to: cargo build --profile release-profiling
+#
+# This profile inherits all release optimizations (opt-level=3, LTO) but:
+#   - strip = false: preserves .symtab in ELF, PDB symbols on Windows
+#   - debug = "line-tables-only": emits function names + line numbers
+#     (enough for xperf/WPA symbol resolution) without full DWARF/CodeView
+#     type info
+#
+# What this enables:
+#   - Guest profiler: kernel.elf retains .symtab → function-level resolution
+#   - Host profiler: nanvixd.pdb contains function symbols → xperf can resolve
+#   - ETW/WPA: full kernel + nanvixd stack resolution via _NT_SYMBOL_PATH
+#
+# User applications (e.g., CPython) must also be compiled with:
+#   - -fno-omit-frame-pointer: enables frame-pointer-based stack walking
+#   - Unstripped .sym file: provides .symtab for the guest symbol resolver
+#   See cpython/.nanvix/config.py and Makefile.nanvix for the CPython setup.
+#
+# General requirements for guest user applications:
+#   - Frame pointers: compile with -fno-omit-frame-pointer (GCC/Clang) or
+#     force-frame-pointers = true (Rust). Without this, stack walks stop
+#     after 1-2 frames.
+#   - Symbols: keep an unstripped binary (.sym file) with .symtab section.
+#     Set NANVIX_USER_SYMBOLS=<path> at runtime. If only .dynsym is
+#     available (stripped binary), static/internal functions won't resolve.
 [profile.release-profiling]
 inherits = "release"
 strip = false

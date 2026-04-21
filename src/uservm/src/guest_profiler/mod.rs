@@ -8,12 +8,18 @@
 //! memory. After the VM exits, collected samples are resolved against ELF
 //! symbol tables and written as folded stacks for flamegraph generation.
 
+#[cfg(target_os = "windows")]
+pub mod etw;
 mod gva;
+#[cfg(target_os = "linux")]
+pub mod perf_linux;
 mod samples;
 mod symbols;
 
 pub use samples::{
     GuestProfiler,
     StackSample,
+    timestamp_frequency,
+    timestamp_now,
 };
 pub use symbols::SymbolResolver;

@@ -627,10 +627,8 @@ impl Vmm {
         let mut timer_started: bool = false;
 
         // Guest profiler: start a dedicated cancel timer for periodic sampling.
-        // Deferred slightly to avoid interfering with the first VP entry.
         let mut profiler_timer: Option<timer::Timer> = None;
         let mut profiler_timer_started: bool = false;
-        let mut exit_count: u64 = 0;
 
         // PIT channel 2 state for LAPIC timer calibration. The guest
         // programs PIT ch2 in one-shot mode and polls port 0x61 bit 5
@@ -666,11 +664,17 @@ impl Vmm {
             // Consume pending IKC notification.  to prevent re-delivery on the next loop iteration.
             let _ = self.ikc_notifier.take_pending();
 
-            // Start profiler cancel timer after a few exits to avoid the first-entry cost.
-            exit_count += 1;
-            if self.guest_profiler.is_some() && !profiler_timer_started && exit_count > 5 {
+            // Start profiler cancel timer on the first exit.
+            // Frequency is configurable via NANVIX_PROFILER_FREQ_HZ (default 1000).
+            // The same frequency should be used by ETW/perf for consistent sampling.
+            if self.guest_profiler.is_some() && !profiler_timer_started {
+                let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1000);
+                let period_us = 1_000_000 / freq_hz;
                 let mut t = timer::Timer::new(self.partition_handle);
-                t.start(1000); // 1ms = 1kHz sampling
+                t.start(period_us);
                 profiler_timer = Some(t);
                 profiler_timer_started = true;
             }
@@ -686,6 +690,7 @@ impl Vmm {
                     );
                     break Ok(locked_vcpu.exit_status());
                 }
+
                 #[cfg(feature = "profile-time")]
                 let run_start: Instant = Instant::now();
 
@@ -696,7 +701,17 @@ impl Vmm {
                     guest_time_acc_us += run_start.elapsed().as_micros() as u64;
                 }
 
-                // Guest profiler: read registers on Interrupted exits (from our timer).
+                // Guest profiler: Interrupted exits mean the timer canceled
+                // the VP while it was executing guest code. Capture guest
+                // registers for a guest stack sample.
+                //
+                // Note: we do NOT sample the host VMM during VM exits here.
+                // Host-side profiling (nanvixd + OS kernel stacks) is handled
+                // by ETW/WPR (Windows) or perf record (Linux), which runs
+                // concurrently and captures host CPU samples with full symbol
+                // resolution via PDB/DWARF. This avoids the complexity of
+                // cooperative in-process sampling and provides deeper stacks
+                // including kernel code (vid.sys, ntoskrnl).
                 let regs = if self.guest_profiler.is_some()
                     && profiler_timer_started
                     && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
@@ -709,7 +724,7 @@ impl Vmm {
                 (ctx, regs)
             };
 
-            // Guest profiler: capture sample after vcpu lock is released.
+            // Guest profiler: capture guest sample after vcpu lock is released.
             //
             // Safety: The vCPU is stopped at this point — WHvRunVirtualProcessor
             // returned with an Interrupted exit, and the next run() call hasn't
@@ -810,6 +825,7 @@ impl Vmm {
                             break Err(e);
                         },
                     };
+
                     if let Some(exit_status) = exit_status {
                         if exit_status == ::config::microvm::DEFAULT_VMM_BOOT_COMPLETE_CMD {
                             // The kernel signals that boot is complete and user-space is about to
@@ -938,9 +954,9 @@ impl Vmm {
     /// Enables guest stack profiling. Returns the profiler handle for
     /// reading samples after VM exit.
     pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
-        let profiler = crate::guest_profiler::GuestProfiler::new(4096);
-        self.guest_profiler = Some(profiler.handle());
-        profiler
+        let guest_profiler = crate::guest_profiler::GuestProfiler::new(4096);
+        self.guest_profiler = Some(guest_profiler.handle());
+        guest_profiler
     }
 
     /// Returns a clone of the IKC notifier for use by the memory thread.

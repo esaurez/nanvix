@@ -50,7 +50,6 @@ use crate::{
     vmm::microvm::kvm::vcpu::{
         VirtualProcessor,
         VirtualProcessorDumpInfo,
-        VirtualProcessorExitContext,
         VirtualProcessorExitReasonRef,
     },
 };
@@ -283,6 +282,8 @@ pub struct Vmm {
     /// Performance timings collector for fine-grained startup breakdown.
     #[cfg(feature = "profile-time")]
     perf_timings: PerfTimings,
+    /// Guest stack profiler (active when guest_profile_path is set).
+    guest_profiler: Option<Arc<std::sync::Mutex<Vec<crate::guest_profiler::StackSample>>>>,
     /// Optional GDB server TCP port (standalone mode only).
     #[cfg(feature = "gdb")]
     gdb_port: Option<u16>,
@@ -554,6 +555,7 @@ impl Vmm {
             ikc_notifier,
             #[cfg(feature = "profile-time")]
             perf_timings,
+            guest_profiler: None,
             #[cfg(feature = "gdb")]
             gdb_port: args.gdb_port,
         })
@@ -632,6 +634,32 @@ impl Vmm {
         #[cfg(feature = "profile-time")]
         let loop_start: Instant = Instant::now();
 
+        // Guest profiler: start a timer thread that sends SIGUSR1 to
+        // interrupt KVM_RUN periodically for stack sampling.
+        let profiler_stop = Arc::new(AtomicBool::new(false));
+        let profiler_thread = if self.guest_profiler.is_some() {
+            let stop = profiler_stop.clone();
+            let vcpu_tid = unsafe { libc::pthread_self() };
+            let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000);
+            let period = std::time::Duration::from_micros(1_000_000 / freq_hz);
+            Some(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(period);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    unsafe {
+                        libc::pthread_kill(vcpu_tid, INTERRUPT_SIGNAL);
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         let result = loop {
             // Check shutdown flag before entering KVM_RUN, and blocking indefinitely.
             if SHUTDOWN.with(|shutdown| shutdown.load(Ordering::SeqCst)) {
@@ -640,7 +668,7 @@ impl Vmm {
                 break Ok(exit_status);
             }
 
-            let exit_context: VirtualProcessorExitContext = {
+            let (exit_context, profile_regs) = {
                 let mut locked_vcpu: MutexGuard<'_, VirtualProcessor> = self.vcpu.blocking_lock();
                 // Exit if the vCPU is no longer online.
                 if !locked_vcpu.is_online() {
@@ -656,8 +684,38 @@ impl Vmm {
                     guest_time_acc_us += run_start.elapsed().as_micros() as u64;
                 }
 
-                ctx
+                // Guest profiler: on Interrupted exits (from our SIGUSR1
+                // timer), read guest registers for stack sampling.
+                let regs = if self.guest_profiler.is_some()
+                    && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
+                {
+                    locked_vcpu.get_regs().ok().map(|r| {
+                        (r.rip as u32, r.rbp as u32, {
+                            // Read CR3 via get_sregs
+                            locked_vcpu.get_sregs().map(|s| s.cr3 as u32).unwrap_or(0)
+                        })
+                    })
+                } else {
+                    None
+                };
+
+                (ctx, regs)
             };
+
+            // Guest profiler: capture sample after vcpu lock is released.
+            if let (Some(profiler_samples), Some((eip, ebp, cr3))) =
+                (&self.guest_profiler, profile_regs)
+            {
+                let vmem_guard = self.vmem.blocking_lock();
+                crate::guest_profiler::GuestProfiler::capture_sample(
+                    profiler_samples,
+                    vmem_guard.get_raw_ptr(),
+                    vmem_guard.get_size(),
+                    eip,
+                    ebp,
+                    cr3,
+                );
+            }
 
             // Parse exit reason.
             match exit_context.reason_ref() {
@@ -721,6 +779,12 @@ impl Vmm {
             }
         };
 
+        // Stop profiler timer.
+        profiler_stop.store(true, Ordering::Relaxed);
+        if let Some(t) = profiler_thread {
+            let _ = t.join();
+        }
+
         // Record guest vs exit-handling time breakdown.
         #[cfg(feature = "profile-time")]
         {
@@ -757,6 +821,19 @@ impl Vmm {
     ///
     pub fn guest(&self) -> Arc<Mutex<Guest>> {
         self.guest.clone()
+    }
+
+    /// Enables guest and host stack profiling. Returns profiler handles for
+    /// reading samples after VM exit.
+    ///
+    /// Note: On KVM, guest stack sampling inside the run loop is not yet
+    /// implemented (requires KVM_GET_REGS + signal-based cancel). The profiler
+    /// handle is created so the API matches the WHP implementation, but no
+    /// guest samples will be collected until KVM sampling is implemented.
+    pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
+        let guest_profiler = crate::guest_profiler::GuestProfiler::new(4096);
+        self.guest_profiler = Some(guest_profiler.handle());
+        guest_profiler
     }
 
     ///

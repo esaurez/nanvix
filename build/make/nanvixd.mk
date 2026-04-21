@@ -22,6 +22,12 @@ endif
 all-nanvixd: init
 	$(HOST_CARGO_BUILD_CMD) $(NANVIXD_CARGO_FEATURES) -p nanvixd
 	$(CP_CMD) $(OBJECTS_DIR)/$(BUILD_MODE)/nanvixd$(CARGO_EXE_SUFFIX) $(BINARIES_DIR)/nanvixd.$(HOST_BIN_EXT)
+ifeq ($(IS_WINDOWS),yes)
+	# Copy PDB alongside the exe for symbol resolution (xperf, WPA, debuggers).
+	@if [ -f "$(OBJECTS_DIR)/$(BUILD_MODE)/nanvixd.pdb" ]; then \
+		cp -f "$(OBJECTS_DIR)/$(BUILD_MODE)/nanvixd.pdb" "$(BINARIES_DIR)/nanvixd.pdb"; \
+	fi
+endif
 	# Build the standalone rootfs image from a seed directory using mkramfs.
 ifeq ($(DEPLOYMENT_MODE),standalone)
 	@mkdir -p $(BINARIES_DIR)/standalone-rootfs-seed/lib
