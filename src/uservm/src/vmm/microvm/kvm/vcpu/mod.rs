@@ -557,7 +557,6 @@ impl VirtualProcessor {
     }
 
     /// Returns the current general-purpose registers of the virtual processor.
-    #[cfg(feature = "gdb")]
     pub fn get_regs(&self) -> Result<kvm_regs> {
         self.fd
             .get_regs()
@@ -573,7 +572,6 @@ impl VirtualProcessor {
     }
 
     /// Returns the current segment and control registers of the virtual processor.
-    #[cfg(feature = "gdb")]
     pub fn get_sregs(&self) -> Result<kvm_sregs> {
         self.fd
             .get_sregs()
