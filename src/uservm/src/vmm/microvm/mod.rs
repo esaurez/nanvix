@@ -785,7 +785,9 @@ impl Vmm {
     /// implemented in the Linux-specific PR. This method only wires up the
     /// profiler data structures so the common code in lib.rs compiles.
     pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
-        let guest_profiler = crate::guest_profiler::GuestProfiler::new(4096);
+        let guest_profiler = crate::guest_profiler::GuestProfiler::new(
+            crate::guest_profiler::DEFAULT_SAMPLE_CAPACITY,
+        );
         self.guest_profiler = Some(guest_profiler.handle());
         guest_profiler
     }

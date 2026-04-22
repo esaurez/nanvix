@@ -32,6 +32,37 @@
 
 use std::process::Command;
 
+//==================================================================================================
+// Constants
+//==================================================================================================
+
+/// Default profiling frequency in Hz. Controls both the guest profiler timer
+/// and the ETW CPU sampling interval (via xperf -SetProfInt).
+const DEFAULT_FREQ_HZ: u64 = 1000;
+
+/// Minimum allowed profiling frequency (Hz).
+const MIN_FREQ_HZ: u64 = 1;
+
+/// Maximum allowed profiling frequency (Hz). Values above this can cause
+/// excessive overhead from signal delivery and register reads.
+const MAX_FREQ_HZ: u64 = 10_000;
+
+/// Default path to xperf.exe (Windows Performance Toolkit).
+/// Overridable via the `NANVIX_XPERF_PATH` environment variable.
+const DEFAULT_XPERF_PATH: &str =
+    "C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe";
+
+/// Default WPR profile name used when a custom .wprp file provides a
+/// NanvixBench profile with larger buffers and Hyper-V providers.
+const DEFAULT_WPR_PROFILE_NAME: &str = "NanvixBench";
+
+/// Fallback WPR profile when no custom .wprp file is found.
+const FALLBACK_WPR_PROFILE: &str = "CPU";
+
+//==================================================================================================
+// ETW Session
+//==================================================================================================
+
 /// Manages a WPR (Windows Performance Recorder) trace session.
 pub struct EtwSession {
     /// Path to the output ETL file.
@@ -60,25 +91,25 @@ impl EtwSession {
     /// - Thread scheduling events
     pub fn start(&mut self) -> Result<(), String> {
         if self.active {
-            return Err("ETW session already active".to_string());
+            let msg = "ETW session already active".to_string();
+            eprintln!("ETW_SESSION: error: {msg}");
+            return Err(msg);
         }
 
         // Cancel any lingering WPR session from a previous crash.
         let _ = Command::new("wpr").args(["-cancel"]).output();
 
         // Set the ETW CPU sampling interval to match the guest profiler
-        // frequency. NANVIX_PROFILER_FREQ_HZ controls both (default 1000Hz).
+        // frequency. NANVIX_PROFILER_FREQ_HZ controls both.
         // xperf -SetProfInt takes 100ns units: 1kHz = 10000.
         let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000)
-            .clamp(1, 10_000); // 1 Hz min (avoid div-by-zero), 10 kHz max (avoid spin).
-        let prof_interval_100ns = 10_000_000 / freq_hz; // e.g., 1kHz → 10000
-        let xperf_path = std::env::var("NANVIX_XPERF_PATH").unwrap_or_else(|_| {
-            "C:\\Program Files (x86)\\Windows Kits\\10\\Windows Performance Toolkit\\xperf.exe"
-                .to_string()
-        });
+            .unwrap_or(DEFAULT_FREQ_HZ)
+            .clamp(MIN_FREQ_HZ, MAX_FREQ_HZ);
+        let prof_interval_100ns = 10_000_000 / freq_hz;
+        let xperf_path =
+            std::env::var("NANVIX_XPERF_PATH").unwrap_or_else(|_| DEFAULT_XPERF_PATH.to_string());
         if std::path::Path::new(&xperf_path).exists() {
             let _ = Command::new(&xperf_path)
                 .args(["-SetProfInt", &prof_interval_100ns.to_string()])
@@ -89,8 +120,11 @@ impl EtwSession {
         // Hyper-V providers). Fall back to the built-in CPU profile.
         let wpr_profile = std::env::var("NANVIX_WPR_PROFILE").ok();
         let (args, profile_name) = if let Some(ref profile_path) = wpr_profile {
-            let profile_arg = format!("{}!NanvixBench", profile_path);
-            (vec!["-start".to_string(), profile_arg, "-filemode".to_string()], "NanvixBench")
+            let profile_arg = format!("{}!{}", profile_path, DEFAULT_WPR_PROFILE_NAME);
+            (
+                vec!["-start".to_string(), profile_arg, "-filemode".to_string()],
+                DEFAULT_WPR_PROFILE_NAME,
+            )
         } else {
             // Check for the profile in the default location relative to the exe.
             let default_profile = std::env::current_exe()
@@ -100,18 +134,21 @@ impl EtwSession {
                         .map(|d| d.join("..\\scripts\\bench\\wpr-profile.wprp"))
                 })
                 .filter(|p| p.exists())
-                .map(|p| format!("{}!NanvixBench", p.display()));
+                .map(|p| format!("{}!{}", p.display(), DEFAULT_WPR_PROFILE_NAME));
 
             if let Some(profile_arg) = default_profile {
-                (vec!["-start".to_string(), profile_arg, "-filemode".to_string()], "NanvixBench")
+                (
+                    vec!["-start".to_string(), profile_arg, "-filemode".to_string()],
+                    DEFAULT_WPR_PROFILE_NAME,
+                )
             } else {
                 (
                     vec![
                         "-start".to_string(),
-                        "CPU".to_string(),
+                        FALLBACK_WPR_PROFILE.to_string(),
                         "-filemode".to_string(),
                     ],
-                    "CPU",
+                    FALLBACK_WPR_PROFILE,
                 )
             }
         };
@@ -123,7 +160,9 @@ impl EtwSession {
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            return Err(format!("WPR start failed: {stderr}"));
+            let msg = format!("WPR start failed: {stderr}");
+            eprintln!("ETW_SESSION: error: {msg}");
+            return Err(msg);
         }
 
         self.active = true;

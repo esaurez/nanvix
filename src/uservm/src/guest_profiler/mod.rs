@@ -25,6 +25,7 @@ mod symbols;
 //==================================================================================================
 
 pub use samples::{
+    DEFAULT_SAMPLE_CAPACITY,
     GuestProfiler,
     StackSample,
     timestamp_frequency,

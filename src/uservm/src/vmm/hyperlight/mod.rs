@@ -598,7 +598,7 @@ impl Vmm {
     /// expose guest registers or memory in the same way as WHP/KVM.
     /// Returns a profiler with an empty sample buffer.
     pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
-        crate::guest_profiler::GuestProfiler::new(0)
+        crate::guest_profiler::GuestProfiler::new(0) // No sampling on Hyperlight.
     }
 
     pub async fn load_snapshot(&self, filepath: String) -> Result<()> {

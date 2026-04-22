@@ -198,18 +198,23 @@ resolution.
 
 ### Quick Start (all-in-one scripts)
 
-**Windows** — run as Administrator for full E2E:
+**Windows** -- run as Administrator for full E2E:
 
 ```powershell
-.\z build --profile --release -- LOG_LEVEL=panic
-.\scripts\bench\full-flamegraph.ps1
+.\z.ps1 build --profile --release -- LOG_LEVEL=panic
+python scripts\bench\flamegraph.py full --guest-elf bin\python.elf
 # Or guest-only (no host stacks):
-.\scripts\bench\guest-flamegraph.ps1
+python scripts\bench\flamegraph.py guest --guest-elf bin\python.elf
 ```
 
-**Linux** — *(Linux support is added in a follow-up PR)*
+**Linux** -- *(Linux support is added in a follow-up PR)*
 
-Without admin/root, guest profiling still works — only the
+```bash
+./z build --profile --release -- LOG_LEVEL=panic
+python3 scripts/bench/flamegraph.py full --guest-elf bin/python.elf
+```
+
+Without admin/root, guest profiling still works -- only the
 host OS kernel stacks require elevation.
 
 ### Manual Steps
@@ -263,7 +268,7 @@ For guest-only:
 cat output.folded | rustfilt | inferno-flamegraph > flamegraph.svg
 ```
 
-For unified guest + host, use `full-flamegraph.ps1` (Windows) which
+For unified guest + host, use `flamegraph.py` which
 handles merging, demangling, and `[GUEST]`/`[HOST]` prefix injection
 automatically.
 
@@ -337,7 +342,7 @@ are included.
 | Host profiling | ETW / WPR (auto-managed) | `perf record` *(Linux PR)* |
 | Timestamps | QPC | `CLOCK_MONOTONIC_RAW` *(Linux PR)* |
 | Host symbols | `.etl` → `analyze-etl.py` / WPA | `perf.data` → `perf script` *(Linux PR)* |
-| E2E script | `full-flamegraph.ps1` | `full-flamegraph.sh` *(Linux PR)* |
+| E2E script | `flamegraph.py full` | `flamegraph.py full` |
 
 ## Environment Variables
 
@@ -373,6 +378,6 @@ are included.
 ### No host stacks in flamegraph
 - Windows: Ensure nanvixd ran as admin (check stderr for `ETW_SESSION`)
 - Set `_NT_SYMBOL_PATH` (Windows) for OS kernel symbol resolution
-- The `full-flamegraph.ps1` script handles symbol paths and merging
+- The `flamegraph.py` script handles symbol paths and merging
   automatically
 

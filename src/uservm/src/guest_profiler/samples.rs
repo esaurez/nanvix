@@ -77,6 +77,11 @@ pub fn timestamp_frequency() -> u64 {
 /// Maximum frame-pointer chain depth per sample.
 const MAX_STACK_DEPTH: usize = 128;
 
+/// Default pre-allocated capacity for the sample buffer. At 1kHz sampling
+/// over a typical 3-5 second workload, ~3000-5000 samples are expected.
+/// 4096 avoids most reallocations without excessive memory use.
+pub const DEFAULT_SAMPLE_CAPACITY: usize = 4096;
+
 /// Kernel/user boundary. Addresses below this are kernel (identity-mapped).
 #[allow(clippy::cast_possible_truncation)] // 32-bit guest constants.
 const USER_BASE: u32 = config::memory_layout::KERNEL_END_RAW as u32;
