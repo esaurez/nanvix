@@ -233,10 +233,7 @@ def main() -> None:
     # Show profiler lines from stderr.
     (output_dir / "nanvixd-stderr.txt").write_text(stderr, encoding="utf-8")
     for line in stderr.splitlines():
-        if any(
-            k in line
-            for k in ("GUEST_PROFILE", "PROFILER", "ETW_SESSION", "PERF_SESSION")
-        ):
+        if any(k in line for k in ("GUEST_PROFILE", "PROFILER", "ETW_SESSION")):
             print(f"  {line.strip()}")
 
     if not guest_folded.exists():

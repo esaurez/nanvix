@@ -6,8 +6,7 @@
 Platform-specific host stack extraction.
 
 Windows: Extracts kernel stacks from ETL via analyze-etl.py.
-Linux:   Extracts kernel stacks from perf.data via perf script + inferno.
-         (Added in the Linux follow-up PR.)
+Linux:   Added in the Linux follow-up PR.
 """
 
 import os
@@ -29,10 +28,9 @@ def extract_host_stacks(
     """
     if sys.platform == "win32":
         return _extract_etw(guest_folded, output_dir, bin_dir)
-    elif sys.platform.startswith("linux"):
-        return _extract_perf(guest_folded, output_dir)
     else:
-        print(f"  Host stack extraction not supported on {sys.platform}")
+        print(f"  Host stack extraction not yet supported on {sys.platform}")
+        print("  (Linux support is added in the Linux follow-up PR)")
         return None
 
 
@@ -101,65 +99,4 @@ def _extract_etw(
         if len(parts) == 2:
             prefixed.append(f"[HOST];{parts[0]} {parts[1]}")
     host_folded.write_text("\n".join(prefixed) + "\n", encoding="utf-8")
-    return host_folded
-
-
-def _extract_perf(guest_folded: Path, output_dir: Path) -> Path | None:
-    """Extract host stacks from perf.data (Linux).
-
-    This is a placeholder -- the full implementation is added in the
-    Linux follow-up PR.
-    """
-    perf_data = Path(f"{guest_folded}.perf.data")
-    if not perf_data.exists():
-        print("  No perf.data (run as root for host kernel stacks)")
-        return None
-
-    print("  Extracting host stacks from perf.data...")
-
-    # Use perf script -F to omit the period field so each event
-    # collapses to count=1, matching guest profiler weighting.
-    try:
-        script_result = subprocess.run(
-            [
-                "perf",
-                "script",
-                "-i",
-                str(perf_data),
-                "-F",
-                "comm,pid,tid,time,event,ip,sym,dso",
-            ],
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        print("  perf not available -- host stacks skipped")
-        return None
-
-    # Collapse stacks via inferno.
-    try:
-        collapse_result = subprocess.run(
-            ["inferno-collapse-perf"],
-            input=script_result.stdout,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        print("  inferno-collapse-perf not available -- host stacks skipped")
-        return None
-
-    # Filter to nanvixd/uservm stacks and prefix with [HOST].
-    host_folded = output_dir / "host.folded"
-    lines = []
-    for line in collapse_result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "nanvixd" in line.lower() or "uservm" in line.lower():
-            lines.append(f"[HOST];{line}")
-    if not lines:
-        print("  No host stacks for nanvixd (perf may need CAP_SYS_ADMIN)")
-        return None
-
-    host_folded.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return host_folded
