@@ -310,6 +310,23 @@ perf report -i output.folded.perf.data
 
 ### Symbol Resolution
 
+**Important**: Always use **unstripped** ELF files for `NANVIX_KERNEL_SYMBOLS`
+and `NANVIX_USER_SYMBOLS`. Stripped binaries contain only `.dynsym` (exported
+symbols), which misses internal/static functions and drops resolution from
+~99% to ~50%.
+
+For CPython, use `python.elf.sym` (the unstripped build output with full
+`.symtab`), **not** `python.elf` (which is stripped for deployment):
+
+```
+python.elf      14 MB   .dynsym only   12,245 symbols   ~50% resolution
+python.elf.sym  48 MB   .symtab        35,252 symbols   ~99% resolution
+```
+
+For the Nanvix kernel, `kernel.elf` retains `.symtab` by default (the build
+runs `objcopy --strip-debug` which removes debug sections but keeps the
+symbol table).
+
 | Symbol format | Meaning |
 |--------------|---------|
 | `PyDict_SetItem` | Resolved C function name |
@@ -318,7 +335,7 @@ perf report -i output.folded.perf.data
 
 Expected resolution rates:
 - **With `.symtab`** (unstripped binaries): ~97%+
-- **With `.dynsym` only** (stripped binaries): ~85%
+- **With `.dynsym` only** (stripped binaries): ~50%
 
 ## Symbol File Details
 
