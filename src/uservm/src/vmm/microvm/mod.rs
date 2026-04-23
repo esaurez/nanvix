@@ -139,6 +139,22 @@ pub use ramfs::RamFs;
 #[cfg(target_os = "linux")]
 const IKC_IRQ: u32 = 9;
 
+/// Default profiling frequency in Hz for the guest profiler timer.
+#[cfg(target_os = "linux")]
+const DEFAULT_PROFILER_FREQ_HZ: u64 = 1000;
+
+/// Minimum allowed profiler frequency (Hz) to avoid division by zero.
+#[cfg(target_os = "linux")]
+const MIN_PROFILER_FREQ_HZ: u64 = 1;
+
+/// Maximum allowed profiler frequency (Hz) to avoid spin-loops.
+#[cfg(target_os = "linux")]
+const MAX_PROFILER_FREQ_HZ: u64 = 10_000;
+
+/// Microseconds per second, used to compute the profiler timer period.
+#[cfg(target_os = "linux")]
+const MICROS_PER_SECOND: u64 = 1_000_000;
+
 ///
 /// # Description
 ///
@@ -612,6 +628,33 @@ impl Vmm {
         })
     }
 
+    /// Spawns a timer thread that periodically sends SIGUSR2 to the vCPU
+    /// thread, interrupting KVM_RUN so the profiler can capture guest
+    /// register state for stack sampling.
+    fn spawn_profiler_timer(
+        stop: Arc<AtomicBool>,
+        vcpu_tid: libc::pthread_t,
+    ) -> std::thread::JoinHandle<()> {
+        let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PROFILER_FREQ_HZ)
+            .clamp(MIN_PROFILER_FREQ_HZ, MAX_PROFILER_FREQ_HZ);
+        let period: std::time::Duration =
+            std::time::Duration::from_micros(MICROS_PER_SECOND / freq_hz);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(period);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                unsafe {
+                    libc::pthread_kill(vcpu_tid, PROFILER_SIGNAL);
+                }
+            }
+        })
+    }
+
     /// Install a signal handler on the vCPU thread.
     fn install_signal_handler() {
         // SAFETY: we install a signal handler that is a no-op so this is safe.
@@ -700,27 +743,11 @@ impl Vmm {
 
         // Guest profiler: start a timer thread that sends SIGUSR2 to
         // interrupt KVM_RUN periodically for stack sampling.
-        let profiler_stop = Arc::new(AtomicBool::new(false));
-        let profiler_thread = if self.guest_profiler.is_some() {
-            let stop = profiler_stop.clone();
-            let vcpu_tid = unsafe { libc::pthread_self() };
-            let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000)
-                .clamp(1, 10_000); // 1 Hz min (avoid div-by-zero), 10 kHz max (avoid spin).
-            let period = std::time::Duration::from_micros(1_000_000 / freq_hz);
-            Some(std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(period);
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    unsafe {
-                        libc::pthread_kill(vcpu_tid, PROFILER_SIGNAL);
-                    }
-                }
-            }))
+        let profiler_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let profiler_thread: Option<std::thread::JoinHandle<()>> = if self.guest_profiler.is_some()
+        {
+            let vcpu_tid: libc::pthread_t = unsafe { libc::pthread_self() };
+            Some(Self::spawn_profiler_timer(profiler_stop.clone(), vcpu_tid))
         } else {
             None
         };
@@ -751,21 +778,18 @@ impl Vmm {
 
                 // Guest profiler: on Interrupted exits (from our SIGUSR2
                 // timer), read guest registers for stack sampling.
-                let regs = if self.guest_profiler.is_some()
+                let regs: Option<(u32, u32, u32)> = if self.guest_profiler.is_some()
                     && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
                 {
                     // Both get_regs and get_sregs must succeed for a valid sample.
                     // If either fails (unlikely), skip this sample rather than
                     // using cr3=0 which would corrupt user-space stack walks.
-                    locked_vcpu
-                        .get_regs()
-                        .ok()
-                        .and_then(|r| {
-                            locked_vcpu
-                                .get_sregs()
-                                .ok()
-                                .map(|s| (r.rip as u32, r.rbp as u32, s.cr3 as u32))
-                        })
+                    locked_vcpu.get_regs().ok().and_then(|r| {
+                        locked_vcpu
+                            .get_sregs()
+                            .ok()
+                            .map(|s| (r.rip as u32, r.rbp as u32, s.cr3 as u32))
+                    })
                 } else {
                     None
                 };
@@ -777,7 +801,7 @@ impl Vmm {
             if let (Some(profiler_samples), Some((eip, ebp, cr3))) =
                 (&self.guest_profiler, profile_regs)
             {
-                let vmem_guard = self.vmem.blocking_lock();
+                let vmem_guard: MutexGuard<'_, VirtualMemory> = self.vmem.blocking_lock();
                 crate::guest_profiler::GuestProfiler::capture_sample(
                     profiler_samples,
                     vmem_guard.get_raw_ptr(),
@@ -864,10 +888,17 @@ impl Vmm {
             }
         };
 
-        // Stop profiler timer.
+        // Stop profiler timer. Relaxed ordering is sufficient here because
+        // join() provides the necessary synchronization barrier, and a stray
+        // SIGUSR2 after the flag is set is harmless (the no-op handler runs,
+        // and the SHUTDOWN check prevents re-entering the loop). The timer
+        // thread is joined while still inside run() (the vCPU thread), so
+        // vcpu_tid remains valid until after join() completes.
         profiler_stop.store(true, Ordering::Relaxed);
         if let Some(t) = profiler_thread {
-            let _ = t.join();
+            if let Err(e) = t.join() {
+                warn!("profiler timer thread panicked: {:?}", e);
+            }
         }
 
         // Record guest vs exit-handling time breakdown.
