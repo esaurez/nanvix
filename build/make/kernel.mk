@@ -11,16 +11,8 @@ all-kernel: init
 	$(KERNEL_CARGO_BUILD_CMD) $(KERNEL_CARGO_FEATURES) -p kernel
 	$(CP_CMD) $(OBJECTS_DIR)/$(TARGET)-kernel/$(BUILD_MODE)/kernel.elf $(BINARIES_DIR)/kernel.elf
 ifeq ($(PROFILER),yes)
-	# Profiling build: strip .debug_* sections but keep .symtab so the
-	# guest profiler can resolve kernel function names. This reduces the
-	# binary loaded into guest RAM (~1.4 MB savings) while preserving
-	# the ~60 KB symbol table needed for stack-trace resolution.
-	# A full-debug copy is kept as kernel.elf.debug for line-level debugging.
-	#
-	# On Windows, rust-objcopy is available via `cargo install cargo-binutils`
-	# and `rustup component add llvm-tools`. On Linux, binutils objcopy is
-	# typically pre-installed. If neither is found, the build continues but
-	# kernel.elf will be larger (~1.4 MB extra debug data in guest RAM).
+	# Strip .debug_* but keep .symtab for guest profiler symbol resolution.
+	# See src/uservm/src/guest_profiler/README.md for setup prerequisites.
 	$(CP_CMD) $(BINARIES_DIR)/kernel.elf $(BINARIES_DIR)/kernel.elf.debug
 	@if command -v rust-objcopy >/dev/null 2>&1; then \
 		rust-objcopy --strip-debug "$(BINARIES_DIR)/kernel.elf"; \
@@ -28,7 +20,6 @@ ifeq ($(PROFILER),yes)
 		objcopy --strip-debug "$(BINARIES_DIR)/kernel.elf"; \
 	else \
 		echo "WARNING: objcopy not found, kernel.elf retains debug sections (~1.4 MB extra)"; \
-		echo "  Install: cargo install cargo-binutils && rustup component add llvm-tools"; \
 	fi
 endif
 

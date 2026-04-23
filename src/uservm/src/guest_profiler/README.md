@@ -154,13 +154,24 @@ cd D:\src\nanvix
 ```
 
 This produces:
-- `bin/kernel.elf` — `.symtab` preserved, `.debug_*` stripped automatically.
+- `bin/kernel.elf` -- `.symtab` preserved, `.debug_*` stripped automatically.
   Only ~60 KB larger than a fully stripped build. Usable directly as
   the symbol file (no separate `.sym` step).
-- `bin/nanvixd.exe` + `bin/nanvixd.pdb` (Windows) — PDB contains function
+- `bin/nanvixd.exe` + `bin/nanvixd.pdb` (Windows) -- PDB contains function
   symbols for xperf/WPA resolution.
 
-Set the symbol path — `kernel.elf` is its own symbol file:
+#### Prerequisites for `--profile` builds
+
+The kernel strip step (`objcopy --strip-debug`) requires one of:
+
+- **Windows**: `cargo install cargo-binutils` and
+  `rustup component add llvm-tools` (provides `rust-objcopy`).
+- **Linux**: `objcopy` from binutils (typically pre-installed).
+
+If neither is found, the build continues but `kernel.elf` will be
+~1.4 MB larger (debug sections remain in guest RAM).
+
+Set the symbol path -- `kernel.elf` is its own symbol file:
 
 ```powershell
 $env:NANVIX_KERNEL_SYMBOLS = "D:\src\nanvix\bin\kernel.elf"
