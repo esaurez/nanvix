@@ -21,12 +21,47 @@
 //! Both our profiler and `perf record` sample at ~1kHz. Since they use
 //! the same monotonic clock, timestamps can be matched directly.
 
-use std::os::unix::fs::PermissionsExt;
-use std::process::{
-    Child,
-    Command,
-    Stdio,
+use std::{
+    os::unix::fs::PermissionsExt,
+    process::{
+        Child,
+        Command,
+        Stdio,
+    },
 };
+
+use ::libc::c_int;
+
+//==================================================================================================
+// Constants
+//==================================================================================================
+
+/// Default profiling frequency in Hz. Controls the `perf record -F` sampling
+/// rate. Matches the guest profiler's default for consistent weighting.
+const DEFAULT_FREQ_HZ: u64 = 1000;
+
+/// Minimum allowed profiling frequency (Hz).
+const MIN_FREQ_HZ: u64 = 1;
+
+/// Maximum allowed profiling frequency (Hz). Values above this can cause
+/// excessive overhead from perf ring buffer processing.
+const MAX_FREQ_HZ: u64 = 10_000;
+
+/// Path to the kernel perf_event_paranoid sysctl. Values <= 0 allow
+/// system-wide profiling without root.
+const PERF_EVENT_PARANOID_PATH: &str = "/proc/sys/kernel/perf_event_paranoid";
+
+/// Maximum time (seconds) to wait for perf to open its perf_event fds
+/// before giving up on readiness detection.
+const PERF_READINESS_TIMEOUT_SECS: u64 = 5;
+
+/// File permissions applied to perf.data after recording. perf record
+/// running as root creates the file with mode 0600; we relax it so the
+/// merge script can read it without root.
+const PERF_DATA_PERMISSIONS: u32 = 0o644;
+
+/// Nanoseconds per second — timestamp frequency for CLOCK_MONOTONIC_RAW.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Manages a `perf record` session for kernel stack sampling.
 pub struct PerfSession {
@@ -62,38 +97,57 @@ impl PerfSession {
         let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1000)
-            .clamp(1, 10_000);
+            .unwrap_or(DEFAULT_FREQ_HZ)
+            .clamp(MIN_FREQ_HZ, MAX_FREQ_HZ);
         // Subtract 1 to avoid aliasing with the guest timer at the same rate.
-        let perf_freq = freq_hz.saturating_sub(1).max(1).to_string();
-        let pid_str = self.pid.to_string();
+        let perf_freq: String = freq_hz.saturating_sub(1).max(1).to_string();
+        let pid_str: String = self.pid.to_string();
 
         // Try system-wide first (includes kernel stacks), fall back to per-PID.
-        let (args, mode) = if Self::can_system_wide() {
+        let (args, mode): (Vec<&str>, &str) = if Self::can_system_wide() {
             (
                 vec![
-                    "record", "-a", "-F", &perf_freq, "-g", "--call-graph", "fp",
-                    "-o", &self.output_path,
+                    "record",
+                    "-a",
+                    "-F",
+                    &perf_freq,
+                    "-g",
+                    "--call-graph",
+                    "fp",
+                    "-o",
+                    &self.output_path,
                 ],
                 "system-wide",
             )
         } else {
             (
                 vec![
-                    "record", "-F", &perf_freq, "-g", "--call-graph", "fp",
-                    "-p", &pid_str, "-o", &self.output_path,
+                    "record",
+                    "-F",
+                    &perf_freq,
+                    "-g",
+                    "--call-graph",
+                    "fp",
+                    "-p",
+                    &pid_str,
+                    "-o",
+                    &self.output_path,
                 ],
                 "per-PID (no kernel stacks)",
             )
         };
 
-        let child = Command::new("perf")
+        let child: Child = Command::new("perf")
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to start perf record: {e}"))?;
+            .map_err(|e| {
+                let msg: String = format!("Failed to start perf record: {e}");
+                eprintln!("PERF_SESSION: error: {msg}");
+                msg
+            })?;
 
         self.child = Some(child);
 
@@ -103,9 +157,10 @@ impl PerfSession {
         // checking /proc/PID/fd for anon_inode:[perf_event] entries.
         // Without this, short workloads finish before perf captures samples.
         if let Some(ref mut c) = self.child {
-            let perf_pid = c.id();
-            let fd_path = format!("/proc/{}/fd", perf_pid);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let perf_pid: u32 = c.id();
+            let fd_path: String = format!("/proc/{}/fd", perf_pid);
+            let deadline: std::time::Instant = std::time::Instant::now()
+                + std::time::Duration::from_secs(PERF_READINESS_TIMEOUT_SECS);
             loop {
                 if std::time::Instant::now() > deadline {
                     eprintln!("PERF_SESSION: warning: timed out waiting for perf to initialize");
@@ -113,21 +168,20 @@ impl PerfSession {
                 }
                 // Check if perf exited early (permissions error, bad args, etc.).
                 if let Ok(Some(status)) = c.try_wait() {
-                    let code = status.code().unwrap_or(-1);
+                    let code: i32 = status.code().unwrap_or(-1);
                     self.child = None;
                     return Err(format!(
-                        "perf exited immediately (code {code}) -- check permissions or perf_event_paranoid"
+                        "perf exited immediately (code {code}) -- check permissions or \
+                         perf_event_paranoid"
                     ));
                 }
                 // Check if perf has opened perf_event file descriptors.
                 if let Ok(entries) = std::fs::read_dir(&fd_path) {
-                    let has_perf_events = entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| {
-                            std::fs::read_link(e.path())
-                                .map(|t| t.to_string_lossy().contains("perf_event"))
-                                .unwrap_or(false)
-                        });
+                    let has_perf_events: bool = entries.filter_map(|e| e.ok()).any(|e| {
+                        std::fs::read_link(e.path())
+                            .map(|t| t.to_string_lossy().contains("perf_event"))
+                            .unwrap_or(false)
+                    });
                     if has_perf_events {
                         // Give perf a small extra moment to finish setup.
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -149,7 +203,7 @@ impl PerfSession {
     /// `perf_event_paranoid <= 0`).
     fn can_system_wide() -> bool {
         // Check perf_event_paranoid: -1 or 0 allows system-wide without root.
-        if let Ok(val) = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") {
+        if let Ok(val) = std::fs::read_to_string(PERF_EVENT_PARANOID_PATH) {
             if let Ok(n) = val.trim().parse::<i32>() {
                 if n <= 0 {
                     return true;
@@ -162,34 +216,32 @@ impl PerfSession {
 
     /// Stops the `perf record` session by sending SIGINT.
     pub fn stop(&mut self) -> Result<String, String> {
-        let mut child = self
+        let mut child: Child = self
             .child
             .take()
             .ok_or_else(|| "No active perf session".to_string())?;
 
         // Send SIGINT to perf to gracefully stop recording.
-        let pid = child.id();
-        let kill_ret = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+        let pid: u32 = child.id();
+        let kill_ret: c_int = unsafe { libc::kill(pid as i32, libc::SIGINT) };
         if kill_ret != 0 {
-            let err = std::io::Error::last_os_error();
+            let err: std::io::Error = std::io::Error::last_os_error();
             // Still reap the child to avoid zombie processes.
             let _ = child.wait();
-            return Err(format!(
-                "Failed to send SIGINT to perf (pid {pid}): {err}"
-            ));
+            return Err(format!("Failed to send SIGINT to perf (pid {pid}): {err}"));
         }
 
         // Wait for perf to finish writing.
-        let output = child
+        let output: std::process::Output = child
             .wait_with_output()
             .map_err(|e| format!("Failed to wait for perf: {e}"))?;
 
         if !output.status.success() && output.status.code() != Some(0) {
             // perf returns non-zero on SIGINT but that's expected
-            let code = output.status.code().unwrap_or(-1);
+            let code: i32 = output.status.code().unwrap_or(-1);
             if code != 2 && code != -1 {
                 // code 2 = interrupted, -1 = signal
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr: std::borrow::Cow<'_, str> = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("perf record failed (code {code}): {stderr}"));
             }
         }
@@ -198,7 +250,7 @@ impl PerfSession {
         // running as root creates the file with mode 0600).
         let _ = std::fs::set_permissions(
             &self.output_path,
-            std::fs::Permissions::from_mode(0o644),
+            std::fs::Permissions::from_mode(PERF_DATA_PERMISSIONS),
         );
 
         eprintln!("PERF_SESSION: saved perf data to {}", self.output_path);
@@ -207,7 +259,7 @@ impl PerfSession {
 
     /// Returns the timestamp frequency (nanoseconds for CLOCK_MONOTONIC_RAW).
     pub fn timestamp_frequency(&self) -> u64 {
-        1_000_000_000
+        NANOS_PER_SECOND
     }
 }
 

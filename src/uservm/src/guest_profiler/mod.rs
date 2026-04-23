@@ -15,7 +15,7 @@
 #[cfg(target_os = "windows")]
 pub mod etw;
 mod gva;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod host_session_stub;
 #[cfg(target_os = "linux")]
 pub mod perf_linux;
