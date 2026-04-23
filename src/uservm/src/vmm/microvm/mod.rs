@@ -50,7 +50,6 @@ use crate::{
     vmm::microvm::kvm::vcpu::{
         VirtualProcessor,
         VirtualProcessorDumpInfo,
-        VirtualProcessorExitContext,
         VirtualProcessorExitReasonRef,
     },
 };
@@ -136,6 +135,22 @@ pub use ramfs::RamFs;
 /// IRQ number used for IKC (inter-kernel communication) notifications.
 #[cfg(target_os = "linux")]
 const IKC_IRQ: u32 = 9;
+
+/// Default profiling frequency in Hz for the guest profiler timer.
+#[cfg(target_os = "linux")]
+const DEFAULT_PROFILER_FREQ_HZ: u64 = 1000;
+
+/// Minimum allowed profiler frequency (Hz) to avoid division by zero.
+#[cfg(target_os = "linux")]
+const MIN_PROFILER_FREQ_HZ: u64 = 1;
+
+/// Maximum allowed profiler frequency (Hz) to avoid spin-loops.
+#[cfg(target_os = "linux")]
+const MAX_PROFILER_FREQ_HZ: u64 = 10_000;
+
+/// Microseconds per second, used to compute the profiler timer period.
+#[cfg(target_os = "linux")]
+const MICROS_PER_SECOND: u64 = 1_000_000;
 
 ///
 /// # Description
@@ -236,6 +251,12 @@ impl IkcNotifier {
 #[cfg(target_os = "linux")]
 pub const INTERRUPT_SIGNAL: c_int = SIGUSR1;
 
+/// Signal used for profiler timer interrupts. We use SIGUSR2 (not SIGUSR1)
+/// because SIGUSR1 is already used by the orchestrator for shutdown, and its
+/// handler sets the SHUTDOWN flag. The profiler needs a signal that merely
+/// interrupts KVM_RUN with -EINTR without triggering shutdown.
+#[cfg(target_os = "linux")]
+pub const PROFILER_SIGNAL: c_int = libc::SIGUSR2;
 /// Signal used to kill the vCPU thread.
 #[cfg(target_os = "linux")]
 pub const KILL_SIGNAL: c_int = libc::SIGKILL;
@@ -339,10 +360,19 @@ pub type StderrFn = dyn Write + Send;
 // Implementations (Linux/KVM only)
 //==================================================================================================
 
-/// Signal handler for the vCPU thread. We install an empty handler to trigger an -EINTR.
+/// Signal handler for the vCPU thread. Sets the shutdown flag to stop re-entering KVM_RUN.
 #[cfg(target_os = "linux")]
 extern "C" fn vcpu_thread_signal_handler(_: i32) {
     SHUTDOWN.with(|shutdown| shutdown.store(true, Ordering::SeqCst));
+}
+
+/// No-op signal handler for profiler timer. Only purpose is to interrupt
+/// KVM_RUN with -EINTR so we can read guest registers for stack sampling.
+/// Must NOT set SHUTDOWN — the VM continues running after sampling.
+#[cfg(target_os = "linux")]
+extern "C" fn profiler_signal_handler(_: i32) {
+    // Intentionally empty: the signal itself causes KVM_RUN to return
+    // with errno=EINTR, which surfaces as an Interrupted exit reason.
 }
 
 #[cfg(target_os = "linux")]
@@ -571,6 +601,33 @@ impl Vmm {
         })
     }
 
+    /// Spawns a timer thread that periodically sends SIGUSR2 to the vCPU
+    /// thread, interrupting KVM_RUN so the profiler can capture guest
+    /// register state for stack sampling.
+    fn spawn_profiler_timer(
+        stop: Arc<AtomicBool>,
+        vcpu_tid: libc::pthread_t,
+    ) -> std::thread::JoinHandle<()> {
+        let freq_hz: u64 = std::env::var("NANVIX_PROFILER_FREQ_HZ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PROFILER_FREQ_HZ)
+            .clamp(MIN_PROFILER_FREQ_HZ, MAX_PROFILER_FREQ_HZ);
+        let period: std::time::Duration =
+            std::time::Duration::from_micros(MICROS_PER_SECOND / freq_hz);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(period);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                unsafe {
+                    libc::pthread_kill(vcpu_tid, PROFILER_SIGNAL);
+                }
+            }
+        })
+    }
+
     /// Install a signal handler on the vCPU thread.
     fn install_signal_handler() {
         // SAFETY: we install a signal handler that is a no-op so this is safe.
@@ -595,6 +652,27 @@ impl Vmm {
             // Notify the error, but don't fail.
             let errno: i32 = unsafe { *libc::__errno_location() };
             error!("error installing signal handler (errno={errno:?})");
+        }
+
+        // Install a separate no-op handler for the profiler signal (SIGUSR2).
+        // This allows the profiler timer to interrupt KVM_RUN without
+        // triggering the shutdown path.
+        let ret2: c_int = unsafe {
+            let profiler_action: sigaction = sigaction {
+                sa_sigaction: profiler_signal_handler as *const () as usize,
+                sa_mask: {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    sigemptyset(&mut set);
+                    set
+                },
+                sa_flags: 0,
+                sa_restorer: None,
+            };
+            sigaction(PROFILER_SIGNAL, &profiler_action, std::ptr::null_mut())
+        };
+        if ret2 != 0 {
+            let errno: i32 = unsafe { *libc::__errno_location() };
+            error!("error installing profiler signal handler (errno={errno:?})");
         }
     }
 
@@ -636,6 +714,17 @@ impl Vmm {
         #[cfg(feature = "profile-time")]
         let loop_start: Instant = Instant::now();
 
+        // Guest profiler: start a timer thread that sends SIGUSR2 to
+        // interrupt KVM_RUN periodically for stack sampling.
+        let profiler_stop: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let profiler_thread: Option<std::thread::JoinHandle<()>> = if self.guest_profiler.is_some()
+        {
+            let vcpu_tid: libc::pthread_t = unsafe { libc::pthread_self() };
+            Some(Self::spawn_profiler_timer(profiler_stop.clone(), vcpu_tid))
+        } else {
+            None
+        };
+
         let result = loop {
             // Check shutdown flag before entering KVM_RUN, and blocking indefinitely.
             if SHUTDOWN.with(|shutdown| shutdown.load(Ordering::SeqCst)) {
@@ -644,7 +733,7 @@ impl Vmm {
                 break Ok(exit_status);
             }
 
-            let exit_context: VirtualProcessorExitContext = {
+            let (exit_context, profile_regs) = {
                 let mut locked_vcpu: MutexGuard<'_, VirtualProcessor> = self.vcpu.blocking_lock();
                 // Exit if the vCPU is no longer online.
                 if !locked_vcpu.is_online() {
@@ -660,8 +749,41 @@ impl Vmm {
                     guest_time_acc_us += run_start.elapsed().as_micros() as u64;
                 }
 
-                ctx
+                // Guest profiler: on Interrupted exits (from our SIGUSR2
+                // timer), read guest registers for stack sampling.
+                let regs: Option<(u32, u32, u32)> = if self.guest_profiler.is_some()
+                    && matches!(ctx.reason_ref(), VirtualProcessorExitReasonRef::Interrupted)
+                {
+                    // Both get_regs and get_sregs must succeed for a valid sample.
+                    // If either fails (unlikely), skip this sample rather than
+                    // using cr3=0 which would corrupt user-space stack walks.
+                    locked_vcpu.get_regs().ok().and_then(|r| {
+                        locked_vcpu
+                            .get_sregs()
+                            .ok()
+                            .map(|s| (r.rip as u32, r.rbp as u32, s.cr3 as u32))
+                    })
+                } else {
+                    None
+                };
+
+                (ctx, regs)
             };
+
+            // Guest profiler: capture sample after vcpu lock is released.
+            if let (Some(profiler_samples), Some((eip, ebp, cr3))) =
+                (&self.guest_profiler, profile_regs)
+            {
+                let vmem_guard: MutexGuard<'_, VirtualMemory> = self.vmem.blocking_lock();
+                crate::guest_profiler::GuestProfiler::capture_sample(
+                    profiler_samples,
+                    vmem_guard.get_raw_ptr(),
+                    vmem_guard.get_size(),
+                    eip,
+                    ebp,
+                    cr3,
+                );
+            }
 
             // Parse exit reason.
             match exit_context.reason_ref() {
@@ -688,9 +810,23 @@ impl Vmm {
                     }
                 },
 
-                // The guest was halted or interrupted, this means we need to power-off.
+                // The guest was halted or interrupted.
+                // When the profiler is active, Interrupted exits are from our
+                // SIGUSR2 timer — just continue the loop (samples were already
+                // captured above). Without the profiler, Interrupted means the
+                // orchestrator requested shutdown via SIGUSR1.
                 VirtualProcessorExitReasonRef::Halt
                 | VirtualProcessorExitReasonRef::Interrupted => {
+                    if self.guest_profiler.is_some()
+                        && matches!(
+                            exit_context.reason_ref(),
+                            VirtualProcessorExitReasonRef::Interrupted
+                        )
+                        && !SHUTDOWN.with(|s| s.load(Ordering::SeqCst))
+                    {
+                        // Profiler-induced interrupt: continue running.
+                        continue;
+                    }
                     let exit_status: u16 = 0;
                     Handle::current().block_on(self.handle_shutdown(exit_status));
                     break Ok(exit_status);
@@ -724,6 +860,14 @@ impl Vmm {
                 },
             }
         };
+
+        // Stop profiler timer.
+        profiler_stop.store(true, Ordering::Relaxed);
+        if let Some(t) = profiler_thread {
+            if let Err(e) = t.join() {
+                warn!("profiler timer thread panicked: {:?}", e);
+            }
+        }
 
         // Record guest vs exit-handling time breakdown.
         #[cfg(feature = "profile-time")]
@@ -775,15 +919,14 @@ impl Vmm {
         self.ikc_notifier.clone()
     }
 
-    /// Enable the guest profiler and return ownership of the `GuestProfiler`.
+    /// Enables guest stack profiling. Returns the `GuestProfiler` whose
+    /// sample buffer is shared with the run loop. The caller drains it
+    /// after VM exit to produce folded stacks.
     ///
-    /// The profiler handle is stored internally so the run loop can record
-    /// samples. The returned `GuestProfiler` owns the sample buffer and is
-    /// used by the caller to drain results after the VM exits.
-    ///
-    /// NOTE: On KVM, guest sampling (timer + SIGUSR2 + register capture) is
-    /// implemented in the Linux-specific PR. This method only wires up the
-    /// profiler data structures so the common code in lib.rs compiles.
+    /// On KVM, the run loop starts a timer thread that sends SIGUSR2 to
+    /// interrupt KVM_RUN at the configured frequency. On each Interrupted
+    /// exit, guest registers (EIP/EBP/CR3) are read and a frame-pointer
+    /// walk captures the guest call stack.
     pub fn enable_guest_profiler(&mut self) -> crate::guest_profiler::GuestProfiler {
         let guest_profiler = crate::guest_profiler::GuestProfiler::new(
             crate::guest_profiler::DEFAULT_SAMPLE_CAPACITY,
