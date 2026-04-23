@@ -47,6 +47,11 @@ const MIN_FREQ_HZ: u64 = 1;
 /// excessive overhead from signal delivery and register reads.
 const MAX_FREQ_HZ: u64 = 10_000;
 
+/// Number of 100-nanosecond intervals per second. Used to convert the
+/// profiling frequency (Hz) to the interval unit that `xperf -SetProfInt`
+/// expects.
+const HUNDRED_NS_PER_SECOND: u64 = 10_000_000;
+
 /// Default path to xperf.exe (Windows Performance Toolkit).
 /// Overridable via the `NANVIX_XPERF_PATH` environment variable.
 const DEFAULT_XPERF_PATH: &str =
@@ -107,7 +112,7 @@ impl EtwSession {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_FREQ_HZ)
             .clamp(MIN_FREQ_HZ, MAX_FREQ_HZ);
-        let prof_interval_100ns = 10_000_000 / freq_hz;
+        let prof_interval_100ns = HUNDRED_NS_PER_SECOND / freq_hz;
         let xperf_path =
             std::env::var("NANVIX_XPERF_PATH").unwrap_or_else(|_| DEFAULT_XPERF_PATH.to_string());
         if std::path::Path::new(&xperf_path).exists() {
@@ -153,10 +158,11 @@ impl EtwSession {
             }
         };
 
-        let result = Command::new("wpr")
-            .args(&args)
-            .output()
-            .map_err(|e| format!("Failed to start WPR: {e}"))?;
+        let result = Command::new("wpr").args(&args).output().map_err(|e| {
+            let msg = format!("Failed to start WPR: {e}");
+            eprintln!("ETW_SESSION: error: {msg}");
+            msg
+        })?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);

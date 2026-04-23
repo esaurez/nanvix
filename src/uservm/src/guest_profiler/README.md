@@ -166,20 +166,19 @@ Set the symbol path — `kernel.elf` is its own symbol file:
 $env:NANVIX_KERNEL_SYMBOLS = "D:\src\nanvix\bin\kernel.elf"
 ```
 
-### Building guest user applications (e.g., CPython)
+### Building guest user applications for profiling
 
 Guest applications compiled with the Nanvix cross-toolchain must:
 
 1. **Preserve frame pointers**: Compile C/C++ code with
-   `-fno-omit-frame-pointer`. For CPython, this is set in
-   `Makefile.nanvix` and `.nanvix/config.py`.
+   `-fno-omit-frame-pointer` so the stack walker can follow the EBP chain.
 
-2. **Save an unstripped symbol file before stripping**: The stripped
-   binary goes into the VM (minimal size). The unstripped `.sym` copy
-   stays on the host for offline symbol resolution.
+2. **Keep an unstripped symbol file**: The stripped binary goes into the
+   VM (minimal size). The unstripped copy stays on the host for offline
+   symbol resolution.
 
 ```powershell
-$env:NANVIX_USER_SYMBOLS = "D:\src\cpython\python.elf.sym"
+$env:NANVIX_USER_SYMBOLS = "path\to\your-app.elf.sym"
 ```
 
 ### Requirements for any guest user application

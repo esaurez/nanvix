@@ -44,7 +44,7 @@ pub fn timestamp_now() -> u64 {
         if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) } != 0 {
             return 0;
         }
-        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+        (ts.tv_sec as u64) * NANOS_PER_SECOND + (ts.tv_nsec as u64)
     }
 }
 
@@ -66,13 +66,18 @@ pub fn timestamp_frequency() -> u64 {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        1_000_000_000 // nanoseconds
+        NANOS_PER_SECOND // nanoseconds
     }
 }
 
 //==================================================================================================
 // Constants
 //==================================================================================================
+
+/// Nanoseconds per second, used as the timestamp frequency on Linux
+/// where `clock_gettime(CLOCK_MONOTONIC_RAW)` returns nanoseconds.
+#[cfg(not(target_os = "windows"))]
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Maximum frame-pointer chain depth per sample.
 const MAX_STACK_DEPTH: usize = 128;
