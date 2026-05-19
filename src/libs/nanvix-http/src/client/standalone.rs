@@ -139,6 +139,12 @@ impl StandaloneState {
     pub async fn cleanup(&self) {
         if let Some(vm) = self.running_vm.lock().await.take() {
             info!("cleanup(): aborting VM");
+            // Forced shutdown path: abort the gateway bridge first, then
+            // `abort_and_wait()` to forcibly terminate the VMM and io_handler
+            // tasks. Unlike `serve_kill()` we do not depend on the guest
+            // exiting naturally, so the drain-invariant ordering does not
+            // apply here -- the abort cuts the io_handler off before it can
+            // block on `output_tx.send().await`.
             vm._gateway_bridge.abort();
             vm.handle.abort_and_wait().await;
             #[cfg(unix)]
@@ -313,10 +319,38 @@ impl<T: Send + Sync + Default + 'static> super::HttpClient<T> {
         let vm: Option<RunningVm> = state.running_vm.lock().await.take();
         match vm {
             Some(running) => {
+                // Wait for the VM to finish BEFORE aborting the
+                // gateway bridge. The bridge is the sole consumer of
+                // guest stdout/stderr on Windows (and the owner of the
+                // gateway UDS on Unix). Aborting first closes
+                // `output_rx` and makes every subsequent guest write
+                // return -1 -- CPython then raises BrokenPipeError at
+                // shutdown and exits 120 many seconds after KILL was
+                // issued by the shim.
+                //
+                // The bridge ends naturally when the io_handler closes
+                // `output_tx` after the VM exits. The abort() below is
+                // defensive cleanup at that point.
+                //
+                // Invariant required for this ordering to be deadlock-
+                // free: the bridge's consumer (the gateway UDS peer on
+                // Unix or the named-pipe peer on Windows) must keep
+                // draining the bytes the bridge forwards. If a future
+                // consumer stops reading mid-stream, the connection
+                // write back-pressures the bridge, the bridge stops
+                // draining `output_rx`, the io_handler eventually
+                // blocks on `output_tx.send().await` (once the bounded
+                // channel buffer fills), and the guest stalls without
+                // reaching VM exit. This invariant
+                // holds for the in-tree gateway test harness and for
+                // the containerd shim; it is the caller's
+                // responsibility to keep it intact for any new
+                // consumer.
+                let wait_result = running.handle.wait().await;
                 running._gateway_bridge.abort();
                 #[cfg(unix)]
                 let _ = ::std::fs::remove_file(&running.gateway_sockaddr);
-                match running.handle.wait().await {
+                match wait_result {
                     Ok(exit_status) => {
                         debug!("serve_kill(): VM exited (exit_status={exit_status})");
                         Ok(message::KillResponse {
