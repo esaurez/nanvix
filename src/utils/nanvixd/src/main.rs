@@ -31,8 +31,6 @@ compile_error!("features `single-process` and `multi-process` are mutually exclu
 
 use ::anyhow::Result;
 use ::log::error;
-#[cfg(unix)]
-use ::nanvix::http::HttpServer;
 #[cfg(feature = "multi-process")]
 use ::nanvix::sandbox_config::SandboxCacheConfig;
 #[cfg(feature = "single-process")]
@@ -41,6 +39,7 @@ use ::nanvix::sandbox_config::SimpleSandboxCacheConfig;
 use ::nanvix::sandbox_config::StandaloneConfig;
 use ::nanvix::{
     config::system::DEFAULT_MACHINE_NAME,
+    http::HttpServer,
     sandbox::NAMED_RESOURCE_PREFIX,
     terminal::Terminal,
 };
@@ -205,6 +204,7 @@ async fn async_main() -> Result<ExitCode> {
         args.networking_mode(),
         #[cfg(feature = "gdb")]
         args.gdb_port(),
+        args.gateway_sockaddr().map(|s| s.to_string()),
     );
 
     #[cfg(feature = "multi-process")]
@@ -273,7 +273,7 @@ async fn async_main() -> Result<ExitCode> {
         return Ok(ExitCode::from(clamped_exit_code));
     }
 
-    #[cfg(unix)]
+    // HTTP mode.
     {
         let http_sockaddr: &str = match args.http_sockaddr() {
             None => {
@@ -290,13 +290,6 @@ async fn async_main() -> Result<ExitCode> {
         }
 
         Ok(ExitCode::SUCCESS)
-    }
-
-    #[cfg(windows)]
-    {
-        let reason: &str = "HTTP mode is not supported on Windows";
-        error!("{reason}");
-        anyhow::bail!(reason);
     }
 }
 
