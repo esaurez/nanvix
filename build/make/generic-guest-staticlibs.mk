@@ -1,7 +1,7 @@
 # Copyright(c) The Maintainers of Nanvix.
 # Licensed under the MIT License.
 
-GUEST_STATICLIB_FEATURES := staticlib $(LOG_LEVEL)
+GUEST_STATICLIB_FEATURES := $(LOG_LEVEL)
 # Enable standalone mode: routes stdout/stderr to debug kcall,
 # file I/O to in-memory VFS, and disables IPC-based syscalls (no linuxd).
 ifeq ($(DEPLOYMENT_MODE),standalone)

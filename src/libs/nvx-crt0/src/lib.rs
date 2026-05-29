@@ -65,7 +65,7 @@ unsafe extern "C" {
     /// Initialises the environment table from a null-terminated array of "KEY=VALUE"
     /// C strings.  Provided by `libposix` (`src/libs/posix/src/stdlib/...`) and only
     /// needed by C executables, which rely on `getenv` / `setenv` / `unsetenv`.
-    fn __nanvix_env_init(envp: *const core::ffi::c_char);
+    fn __nanvix_env_init(envp: *const *const core::ffi::c_char);
 }
 
 //==================================================================================================
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn _start(argp: *mut i8, envp: *mut i8) -> ! {
     // strings, which is exactly the format expected by __nanvix_env_init().
     #[cfg(feature = "c-main")]
     unsafe {
-        __nanvix_env_init(environ as *const core::ffi::c_char);
+        __nanvix_env_init(environ as *const *const core::ffi::c_char);
     }
 
     cfg_if::cfg_if! {
