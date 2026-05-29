@@ -15,6 +15,7 @@
 
 extern crate libc_string;
 extern crate nvx;
+extern crate nvx_crt0;
 
 use ::core::sync::atomic::Ordering;
 use ::sys::error::{
@@ -42,8 +43,8 @@ const SNAPSHOT_FLAG: &[u8] = b"--snapshot";
 
 /// Returns `true` if `--snapshot` was passed as a command-line argument.
 fn should_snapshot() -> bool {
-    let argc: i32 = nvx::ARGC.load(Ordering::SeqCst);
-    let argv: *mut *const u8 = nvx::ARGV.load(Ordering::SeqCst);
+    let argc: i32 = nvx_crt0::ARGC.load(Ordering::SeqCst);
+    let argv: *mut *const u8 = nvx_crt0::ARGV.load(Ordering::SeqCst);
 
     if argv.is_null() || argc <= 1 {
         return false;
