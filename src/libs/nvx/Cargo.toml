@@ -27,9 +27,7 @@ compiler_builtins = { workspace = true, optional = true }
 sysalloc = { workspace = true }
 
 [features]
-default = ["staticlib"]
-staticlib = []
-standalone = []
+default = []
 rustc-dep-of-std = [
     "alloc",
     "core",

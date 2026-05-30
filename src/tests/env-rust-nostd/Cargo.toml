@@ -15,6 +15,7 @@ name = "env-rust-nostd"
 
 [dependencies]
 nvx = { workspace = true }
+nvx-crt0 = { workspace = true, features = ["rust-main"] }
 libc_string = { workspace = true }
 sys = { workspace = true, features = ["kcall"] }
 sysapi = { workspace = true }
@@ -27,4 +28,4 @@ cfg-if = { workspace = true }
 
 [features]
 default = ["panic"]
-panic = ["nvx/panic"]
+panic = ["nvx/panic", "nvx-crt0/panic"]
