@@ -518,28 +518,26 @@ impl DynamicLibrary {
         // Symbol is either undefined in this library or not in its dynsym at
         // all. Per POSIX, dlsym must search the full dependency tree regardless
         // of whether the root library references the symbol.
-        for (_dlname, dlfile) in self.dependencies.iter() {
-            if let Some(dlfile) = dlfile {
-                // Guard against deadlock: if the mutex is held by an ancestor
-                // in our call chain (true cycle back to a locked parent) or by
-                // a concurrent lookup, skip rather than spinning forever.
-                if dlfile.is_locked() {
-                    continue;
-                }
+        for dlfile in self.dependencies.values().flatten() {
+            // Guard against deadlock: if the mutex is held by an ancestor
+            // in our call chain (true cycle back to a locked parent) or by
+            // a concurrent lookup, skip rather than spinning forever.
+            if dlfile.is_locked() {
+                continue;
+            }
 
-                // Use the Arc's heap allocation address as a unique,
-                // lock-free identifier for this dependency. Skip if already
-                // traversed in this lookup (diamond-shaped dependency).
-                let id: usize = Arc::as_ptr(dlfile) as usize;
-                if !visited.insert(id) {
-                    continue;
-                }
+            // Use the Arc's heap allocation address as a unique,
+            // lock-free identifier for this dependency. Skip if already
+            // traversed in this lookup (diamond-shaped dependency).
+            let id: usize = Arc::as_ptr(dlfile) as usize;
+            if !visited.insert(id) {
+                continue;
+            }
 
-                let dlfile: MutexGuard<'_, DynamicLibrary> = dlfile.lock();
+            let dlfile: MutexGuard<'_, DynamicLibrary> = dlfile.lock();
 
-                if let Some(result) = dlfile.lookup_in_load_group(symbol_name, visited)? {
-                    return Ok(Some(result));
-                }
+            if let Some(result) = dlfile.lookup_in_load_group(symbol_name, visited)? {
+                return Ok(Some(result));
             }
         }
 
@@ -561,6 +559,29 @@ impl DynamicLibrary {
         let symbol_value: usize = match self.lookup(symbol_name)? {
             Some((base, symbol_value)) => base + symbol_value,
             None => {
+                // Per the System V ABI (gABI, chapter "Symbol Table"), an undefined
+                // symbol whose binding is `STB_WEAK` and which cannot be resolved at
+                // dynamic-link time is silently taken to have the value zero (or `NULL`
+                // for function symbols). Every mainstream ELF dynamic loader (glibc
+                // `elf/dl-lookup.c`, musl `ldso/dynlink.c`, FreeBSD `rtld-elf/rtld.c`,
+                // Android Bionic `linker/linker_relocate.cpp`) implements this rule,
+                // and we follow them here.
+                //
+                // Substituting zero is safe across the relocation types we currently
+                // handle (R_386_32, R_386_PC32, R_386_JMP_SLOT, R_386_GLOB_DAT): the
+                // resulting GOT/PLT entry or in-place 32-bit slot will be null, so any
+                // code path that actually dereferences the symbol traps deterministically
+                // — matching the contract the spec puts on the program (it must
+                // null-check before use).
+                if sym.is_undefined() && sym.is_weak() {
+                    ::syslog::debug!(
+                        "get_symbol_value(): resolving unresolved weak undefined symbol to zero \
+                         per System V ABI (symbol_name={:?})",
+                        symbol_name
+                    );
+                    return Ok(0);
+                }
+
                 let reason: &str = "symbol not found";
                 ::syslog::warn!(
                     "get_symbol_value(): {} (symbol_name={:?}, symbol={:?})",
@@ -586,6 +607,17 @@ impl DynamicLibrary {
             None;
 
         for sym in self.dynsym.iter() {
+            // Skip undefined symbols: with the STB_WEAK handling in
+            // `get_symbol_value()`, an unresolved weak undefined symbol resolves
+            // to 0 — that's the right behaviour for relocation but would cause
+            // `dladdr()` to report a ghost symbol at address 0 for every weak
+            // undefined entry in the dynsym.  Symbols that have an in-module
+            // definition (or that resolved to a real address elsewhere) are
+            // never `SHN_UNDEF` in this DSO's dynsym, so this filter only
+            // excludes references the loader had to substitute zero for.
+            if sym.is_undefined() {
+                continue;
+            }
             if let Ok(symbol_value) = self.get_symbol_value(sym) {
                 let sym_addr: VirtualAddress = VirtualAddress::from_raw_value(symbol_value);
                 if sym_addr <= symbol_addr {
