@@ -20,7 +20,8 @@ sys = { workspace = true }
 syscall = { workspace = true, features = ["syscall"] }
 sysapi = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
+sysalloc = { workspace = true }
 config = { workspace = true }
 syslog = { workspace = true, default-features = true }
 

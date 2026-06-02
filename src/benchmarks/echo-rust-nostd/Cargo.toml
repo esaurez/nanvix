@@ -15,7 +15,7 @@ name = "echo-rust-nostd"
 
 [dependencies]
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
 libc_string = { workspace = true }
 sys = { workspace = true }
 sysapi = { workspace = true }

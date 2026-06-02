@@ -17,7 +17,8 @@ name = "linux-app"
 libc_string = { workspace = true }
 sys = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
+sysalloc = { workspace = true }
 sysapi = { workspace = true }
 syscall = { workspace = true, features = ["syscall"] }
 syslog = { workspace = true, default-features = true }

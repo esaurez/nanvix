@@ -18,7 +18,8 @@ arch = { workspace = true }
 config = { workspace = true }
 libc_string = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
+sysalloc = { workspace = true }
 static_assert = { workspace = true }
 sys = { workspace = true, features = ["kcall"] }
 syslog = { workspace = true, default-features = true }

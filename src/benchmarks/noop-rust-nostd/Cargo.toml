@@ -16,7 +16,7 @@ name = "noop-rust-nostd"
 [dependencies]
 cfg-if = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
 libc_string = { workspace = true }
 sys = { workspace = true }
 sysalloc = { workspace = true }

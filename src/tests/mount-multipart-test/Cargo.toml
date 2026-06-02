@@ -16,7 +16,8 @@ name = "mount-multipart-test"
 [dependencies]
 libc_string = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
+sysalloc = { workspace = true }
 sys = { workspace = true }
 sysapi = { workspace = true }
 syscall = { workspace = true, features = ["syscall"] }

@@ -19,7 +19,8 @@ config = { workspace = true }
 hostfs-api = { workspace = true }
 sys = { workspace = true }
 nvx = { workspace = true }
-nvx-crt0 = { workspace = true, features = ["rust-main"] }
+nvx-crt0 = { workspace = true, features = ["rust-main", "provides-allocator"] }
+sysalloc = { workspace = true }
 proc = { workspace = true, features = ["syscall"] }
 vfs = { workspace = true }
 multiimage = { workspace = true }

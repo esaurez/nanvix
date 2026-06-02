@@ -33,8 +33,14 @@ pub mod pie;
 // Imports
 //==================================================================================================
 
-// We link the `alloc` crate when building static libraries to provide heap allocation support.
-#[cfg(not(feature = "rustc-dep-of-std"))]
+// We link the `alloc` crate when building static libraries to provide
+// heap allocation support.  Gated on the `runtime` feature for the same
+// reason as the `init`/`cleanup` functions: consumers that do NOT bring
+// up the runtime (notably `nvx-crt0` in its stateless staticlib build)
+// must not pull `alloc` into their compilation, because `alloc` requires
+// a `#[global_allocator]` which would re-introduce the duplicate-
+// `sysalloc` problem.
+#[cfg(all(not(feature = "rustc-dep-of-std"), feature = "runtime"))]
 extern crate alloc;
 
 //==================================================================================================
@@ -46,6 +52,7 @@ extern crate alloc;
 /// Brings up the heap-region reservation, the `sysalloc` allocator, and the
 /// thread-data-area (TDA) used for thread-local storage.  Called from the
 /// startup crate (`nvx-crt0::_start`) right after `pie::relocate_pie_binary`.
+#[cfg(feature = "runtime")]
 pub fn init() {
     #[cfg(any(target_os = "none", target_os = "nanvix"))]
     {
@@ -82,6 +89,7 @@ pub fn init() {
 /// Tears down the thread-data-area and the `sysalloc` allocator.  Called
 /// from the startup crate (`nvx-crt0::_start`) right before the process
 /// exits via the `__kcall_exit` syscall.
+#[cfg(feature = "runtime")]
 pub fn cleanup() {
     #[cfg(any(target_os = "none", target_os = "nanvix"))]
     if let Err(error) = ::sysalloc::tda::cleanup() {
