@@ -70,11 +70,108 @@ GUEST_STATICLIB_CRATE_TYPE_nvx-crt0 := staticlib
 # `crate-type`); the rest use the regular `cargo build`.
 GUEST_STATICLIB_CARGO_BUILD = $(if $(GUEST_STATICLIB_CRATE_TYPE_$(1)),$(subst cargo build,cargo rustc,$(GUEST_CARGO_BUILD_CMD)) --lib --crate-type $(GUEST_STATICLIB_CRATE_TYPE_$(1)),$(GUEST_CARGO_BUILD_CMD))
 
+#===================================================================================================
+# Guest staticlib libm visibility fix
+#===================================================================================================
+# Rust's `compiler_builtins` crate (pulled in transitively by `core` for every
+# guest staticlib) emits ~28 libm wrapper symbols as `STB_WEAK + STV_HIDDEN`
+# on every non-Windows, non-Apple target. Source: `compiler-builtins`
+# `src/macros.rs` (linkage = "weak" for non-Windows/Apple) and
+# `src/math/mod.rs` (the `full_availability` block).
+#
+# Most of compiler_builtins is integer-arithmetic / soft-float helpers
+# (`__adddf3`, `__divdi3`, `__bswapdi2`, ...) that newlib's libc / libm do
+# NOT provide. They MUST stay WEAK HIDDEN where they are — they are the
+# canonical providers for any C or Rust code that needs them.
+#
+# The libm wrappers (the 28 names below) are different. Newlib's libm
+# defines all of them as `STB_GLOBAL + STV_DEFAULT`. Under normal archive
+# linking this is harmless: WEAK loses to STRONG. But Nanvix guest
+# executables that dlopen extension modules (CPython, future plugins) link
+# with:
+#
+#   -Wl,--whole-archive libnvx_crt0.a libposix.a libc.a libm.a ...
+#   -Wl,--allow-multiple-definition
+#   -Wl,--export-dynamic
+#
+# so dlopen'd modules can resolve libm names at runtime against the main
+# executable's `.dynsym`. With this combination GNU ld merges the two
+# `sqrt` definitions body-from-strong-visibility-from-most-restrictive. The
+# result is STRONG HIDDEN, demoted to LOCAL after link. `--export-dynamic`
+# cannot put a LOCAL symbol into `.dynsym`, so dlopen'd modules fail at
+# runtime with "symbol not found" on `sqrt`/`cbrt`/etc.
+#
+# The fix: after each guest staticlib is built, run `rust-objcopy
+# --localize-symbol=<sym>` on each libm wrapper name it defines. LOCAL
+# symbols don't participate in cross-object resolution, so libm.a's STRONG
+# DEFAULT definitions become the only visible-to-the-linker definitions.
+# `--export-dynamic` works as intended. Symbols not in the list are
+# untouched, so integer/soft-float intrinsics keep their WEAK HIDDEN
+# semantics.
+#
+# Why a hardcoded list rather than autodiscovery: a "diff against
+# libm.a" approach needs libm.a available at the moment libposix.a is
+# built, which is awkward on developer setups (Windows hosts have no
+# i686-nanvix toolchain locally; libm.a lives only inside Docker images).
+# The 28 libm wrapper names below are C99 standard math symbols
+# (math.h public API) — newlib's libm has all of them, every other libm
+# has all of them, and the set has not changed in decades. Hardcoding
+# is robust here precisely because the contract being targeted is a
+# stable C99 specification.
+#
+# Safety of localization: no Nanvix Rust no_std guest code calls these
+# C math symbols. `core`'s `f64::sqrt()` etc. lower to LLVM intrinsics
+# (`@llvm.sqrt.f64` -> hardware FSQRT/SQRTSD), bypassing extern "C"
+# entirely. The `std` variants that DO call C math (`sin`, `cos`, `tan`,
+# ...) are absent from `-Zbuild-std=core,alloc`. So the WEAK HIDDEN math
+# symbols have no Rust caller; localizing them affects only the
+# cross-archive visibility merge.
+#
+# Note on the 11 newlib-internal `__math_*` helpers (`__math_invalid`,
+# `__math_oflow`, ...): those are GLOBAL HIDDEN at source in
+# `newlib/libm/common/math_config.h` (ported from ARM optimized-routines,
+# same as glibc and musl). They are deliberately library-private and
+# called only from inside libm's own internals (e.g. `__ieee754_sqrt` ->
+# `__math_invalid`). In a Nanvix executable, those internals live inside
+# the executable alongside the helpers themselves; the PC-relative call
+# between them is resolved at static-link time and never touches
+# `.dynsym`. dlopen'd modules don't need them — they call public names
+# like `sqrt`, which dispatches to the executable's `sqrt`, which
+# internally calls `__math_invalid` if needed. This is identical to how
+# Linux ships libm.so.6 with the same HIDDEN attribute on the same
+# helpers, and dlopen'd code on Linux never needs them either. NOT
+# exporting them is the correct behaviour, not a bug.
+#
+# Tooling: rust-objcopy comes from cargo-binutils, a build prerequisite
+# (see build/make/kernel.mk for an identical fallback pattern). The
+# command is a no-op on staticlibs that don't define these symbols.
+GUEST_STATICLIB_OBJCOPY := $(shell command -v rust-objcopy 2>/dev/null || command -v objcopy 2>/dev/null)
+
+# C99 libm wrapper names that newlib's libm.a defines as STRONG DEFAULT and
+# that compiler_builtins shadows as WEAK HIDDEN. Stable; effectively pinned
+# by the C99 math.h public API.
+GUEST_STATICLIB_LIBM_WRAPPERS := \
+	cbrt cbrtf ceil ceilf copysign copysignf fabs fabsf \
+	fdim fdimf floor floorf fma fmaf fmax fmaxf fmin fminf \
+	fmod fmodf rint rintf round roundf sqrt sqrtf trunc truncf
+
+GUEST_STATICLIB_LIBM_LOCALIZE_ARGS := \
+	$(addprefix --localize-symbol=,$(GUEST_STATICLIB_LIBM_WRAPPERS))
+
+define GUEST_STATICLIB_LIBM_FIX_CMD
+	if [ -n "$(GUEST_STATICLIB_OBJCOPY)" ]; then \
+	    $(GUEST_STATICLIB_OBJCOPY) $(GUEST_STATICLIB_LIBM_LOCALIZE_ARGS) $(1); \
+	else \
+	    echo "WARNING: rust-objcopy/objcopy not found; skipping libm visibility fix on $(1)"; \
+	fi;
+endef
+
 # Per-package rules retained for direct invocation (e.g., make all-guest-staticlib-<pkg>).
 define GUEST_STATICLIB_RULES
 all-guest-staticlib-$(1): init
 	$(call GUEST_STATICLIB_CARGO_BUILD,$(1)) -p $(1) $(call GUEST_STATICLIB_PKG_FEATURES,$(1))
 	$(CP_CMD) $(OBJECTS_DIR)/$(TARGET)-user/$(BUILD_MODE)/$(call guest_staticlib_artifact,$(1)) $(LIBRARIES_DIR)/$(call guest_staticlib_artifact,$(1))
+	@$(call GUEST_STATICLIB_LIBM_FIX_CMD,$(LIBRARIES_DIR)/$(call guest_staticlib_artifact,$(1)))
 
 check-guest-staticlib-$(1):
 	@$(GUEST_CARGO_CHECK_CMD) -p $(1)
@@ -130,7 +227,9 @@ all-guest-staticlibs: init
 	$(if $(_GUEST_STATICLIB_PKGS_DEFAULT),$(GUEST_CARGO_BUILD_CMD) $(_GUEST_STATICLIB_PKGS_DEFAULT) $(GUEST_STATICLIB_CARGO_FEATURES))
 	$(foreach pkg,$(_GUEST_STATICLIB_PKGS_OVERRIDE),$(call _OVERRIDE_BUILD_CMD,$(pkg)) &&) true
 	@for pkg in $(ALL_GUEST_STATIC_LIBS); do \
-		$(CP_CMD) $(OBJECTS_DIR)/$(TARGET)-user/$(BUILD_MODE)/lib$$(echo $$pkg | sed 's/-/_/g').a $(LIBRARIES_DIR)/lib$$(echo $$pkg | sed 's/-/_/g').a; \
+		artifact=lib$$(echo $$pkg | sed 's/-/_/g').a; \
+		$(CP_CMD) $(OBJECTS_DIR)/$(TARGET)-user/$(BUILD_MODE)/$$artifact $(LIBRARIES_DIR)/$$artifact; \
+		$(call GUEST_STATICLIB_LIBM_FIX_CMD,$(LIBRARIES_DIR)/$$artifact) \
 	done
 
 check-guest-staticlibs:
