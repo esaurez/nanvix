@@ -368,6 +368,33 @@ pub extern "C" fn pthread_equal(thread1: pthread_t, thread2: pthread_t) -> c_int
 // pthread_once()
 //==================================================================================================
 
+/// State constants used internally by `pthread_once()` for the
+/// `init_executed` field of `pthread_once_t`.
+///
+/// # Description
+///
+/// `init_executed` doubles as a state-machine word.  The four
+/// values directly mirror musl libc's encoding in
+/// `src/thread/pthread_once.c`, which lets us upgrade to a
+/// futex-based multi-threaded implementation without changing
+/// the state semantics.
+///
+/// In a future multi-threaded model:
+///
+/// - `ONCE_NEVER_RUN` → CAS to `ONCE_IN_PROGRESS` and run `init`.
+/// - `ONCE_IN_PROGRESS` → CAS to `ONCE_WAIT` and block on futex.
+/// - `ONCE_WAIT` → continue waiting on the futex word.
+/// - `ONCE_DONE` → fast-path return.
+///
+/// In the current single-threaded model only `NEVER_RUN`,
+/// `IN_PROGRESS`, and `DONE` are reachable; `ONCE_WAIT` is
+/// reserved for the future upgrade.
+const ONCE_NEVER_RUN: c_int = 0;
+const ONCE_DONE: c_int = 1;
+const ONCE_IN_PROGRESS: c_int = 2;
+#[allow(dead_code)]
+const ONCE_WAIT: c_int = 3;
+
 ///
 /// # Description
 ///
@@ -396,8 +423,144 @@ pub unsafe extern "C" fn pthread_once(
     once_control: *mut pthread_once_t,
     init_routine: Option<unsafe extern "C" fn()>,
 ) -> c_int {
-    // TODO: https://github.com/nanvix/nanvix/issues/513
-    ::syslog::debug!("pthread_once(): not implemented");
+    // Argument validation.
+    if once_control.is_null() {
+        ::syslog::warn!("pthread_once(): null once_control");
+        return ErrorCode::InvalidArgument.get();
+    }
+    let Some(init_fn) = init_routine else {
+        ::syslog::warn!("pthread_once(): null init_routine");
+        return ErrorCode::InvalidArgument.get();
+    };
+
+    // Sanity check: `is_initialized` must equal 1 after
+    // `PTHREAD_ONCE_INIT`.  Any other value indicates a caller
+    // bug (e.g. a forgotten or corrupted static initializer).
+    //
+    // SAFETY: `once_control` was checked non-null above and is
+    // assumed to point to a valid `pthread_once_t` per POSIX
+    // contract.
+    let once: &mut pthread_once_t = unsafe { &mut *once_control };
+    if once.is_initialized() != pthread_once_t::IS_INITIALIZED_VALUE {
+        ::syslog::warn!(
+            "pthread_once(): once_control not initialized with PTHREAD_ONCE_INIT"
+        );
+        return ErrorCode::InvalidArgument.get();
+    }
+
+    // Fast path: already done.
+    //
+    // # Memory ordering
+    //
+    // POSIX requires that on return from `pthread_once`, the
+    // effects of `init_routine` are visible.  On the fast path
+    // this is provided by the volatile read + acquire compiler
+    // fence: the read cannot be hoisted, and the fence prevents
+    // subsequent loads from being reordered before the
+    // observation of `ONCE_DONE`.
+    //
+    // On the current single-threaded target this fence is a
+    // no-op at runtime (no SMP), but it is required for
+    // correctness when the multi-threaded upgrade is performed.
+    let state_ptr: *mut c_int = once.init_executed_ptr();
+    {
+        let current = unsafe { ::core::ptr::read_volatile(state_ptr) };
+        if current == ONCE_DONE {
+            ::core::sync::atomic::compiler_fence(::core::sync::atomic::Ordering::Acquire);
+            return 0;
+        }
+        if current == ONCE_IN_PROGRESS {
+            // POSIX (APPLICATION USAGE) says recursive calls on
+            // the same `once_control` from inside `init_routine`
+            // are undefined and shall not return.  In a
+            // single-threaded model the only way to reach this
+            // state is a recursive call: log and return success
+            // without re-running (the in-flight init will finish
+            // when control unwinds).
+            ::syslog::warn!(
+                "pthread_once(): recursive call on the same once_control \
+                 (in-progress) -- not re-running init"
+            );
+            return 0;
+        }
+    }
+
+    // Slow path: transition NEVER_RUN -> IN_PROGRESS, run init,
+    // transition IN_PROGRESS -> DONE.
+    //
+    // # Multi-threaded upgrade
+    //
+    // Replace the volatile write with a CAS:
+    //
+    //     loop {
+    //         match cas(state_ptr, NEVER_RUN, IN_PROGRESS) {
+    //             Ok(_)              => break,            // we are the initializer
+    //             Err(DONE)          => return 0,         // someone else finished
+    //             Err(IN_PROGRESS)
+    //               | Err(WAIT)      => {
+    //                 cas(state_ptr, IN_PROGRESS, WAIT);
+    //                 futex_wait(state_ptr, WAIT);
+    //                 continue;
+    //             }
+    //             _                  => unreachable!(),
+    //         }
+    //     }
+    //
+    // and replace the final `write_volatile(DONE)` with an
+    // atomic release-store followed by `futex_wake_all`.
+    unsafe { ::core::ptr::write_volatile(state_ptr, ONCE_IN_PROGRESS) };
+
+    // POSIX cancellation semantics:
+    //
+    //   "If init_routine is a cancellation point and is canceled,
+    //    the effect on once_control shall be as if pthread_once()
+    //    was never called."
+    //
+    // Rust does not have `pthread_cleanup_push`, but a Drop guard
+    // gives equivalent behavior across both panic-unwind and
+    // future cancellation paths: if `init_fn` panics or unwinds,
+    // `OnceGuard::drop` resets the state to `NEVER_RUN` so the
+    // next call retries from scratch.
+    //
+    // In ST mode without unwinding there is no waiter to wake;
+    // in the MT upgrade `OnceGuard::drop` would also call
+    // `futex_wake_all` on the state pointer.
+    struct OnceGuard {
+        state_ptr: *mut c_int,
+        completed: bool,
+    }
+    impl ::core::ops::Drop for OnceGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                // SAFETY: `state_ptr` was validated by the
+                // caller of `pthread_once` and remains live
+                // for the duration of this call.
+                unsafe {
+                    ::core::ptr::write_volatile(self.state_ptr, ONCE_NEVER_RUN);
+                }
+            }
+        }
+    }
+    let mut guard = OnceGuard {
+        state_ptr,
+        completed: false,
+    };
+
+    // SAFETY: `init_fn` is a non-null `extern "C" fn()` per the
+    // POSIX contract; the caller is responsible for ensuring it
+    // does not violate Rust's aliasing rules on shared state.
+    unsafe { init_fn() };
+
+    guard.completed = true;
+    drop(guard);
+
+    // Release fence: ensures all stores performed by `init_fn`
+    // are globally visible before `ONCE_DONE` becomes observable
+    // on other CPUs.  No-op at runtime in ST/single-CPU mode;
+    // required for correctness once SMP/MT lands.
+    ::core::sync::atomic::compiler_fence(::core::sync::atomic::Ordering::Release);
+    unsafe { ::core::ptr::write_volatile(state_ptr, ONCE_DONE) };
+
     0
 }
 

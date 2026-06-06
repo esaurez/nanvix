@@ -301,6 +301,61 @@ impl pthread_once_t {
 
     /// Size of `pthread_once_t` structure.
     pub const SIZE: usize = Self::SIZE_OF_IS_INITIALIZED + Self::SIZE_OF_INIT_EXECUTED;
+
+    /// Sentinel value of `is_initialized` set by `PTHREAD_ONCE_INIT`.
+    pub const IS_INITIALIZED_VALUE: c_int = 1;
+
+    /// Returns the value of the `is_initialized` field.
+    ///
+    /// # Description
+    ///
+    /// `is_initialized` is set to `1` by `PTHREAD_ONCE_INIT`.  A
+    /// non-`1` value indicates that the caller forgot to use
+    /// `PTHREAD_ONCE_INIT` and the `pthread_once_t` is uninitialized.
+    pub fn is_initialized(&self) -> c_int {
+        self.is_initialized
+    }
+
+    /// Returns the value of the `init_executed` field.
+    ///
+    /// # Description
+    ///
+    /// `init_executed` is used by `pthread_once()` as a state
+    /// machine to coordinate calling `init_routine` exactly once
+    /// per `pthread_once_t` object.  See the implementation in
+    /// `libposix` for the state encoding.
+    pub fn init_executed(&self) -> c_int {
+        self.init_executed
+    }
+
+    /// Sets the value of the `init_executed` field.
+    ///
+    /// # Description
+    ///
+    /// See `init_executed()` for the state encoding.  This setter
+    /// is used by `pthread_once()` to transition between states.
+    pub fn set_init_executed(&mut self, value: c_int) {
+        self.init_executed = value;
+    }
+
+    /// Returns a mutable raw pointer to the `init_executed` field.
+    ///
+    /// # Description
+    ///
+    /// `pthread_once()` uses this pointer with `ptr::read_volatile`
+    /// / `ptr::write_volatile` to implement the state-machine
+    /// transitions without the compiler optimising the loads or
+    /// stores away.  It is the same pointer that a future
+    /// multi-threaded implementation would pass to `futex_wait`
+    /// / `futex_wake_all`.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid while the caller holds
+    /// a reference to the underlying `pthread_once_t`.
+    pub fn init_executed_ptr(&mut self) -> *mut c_int {
+        ::core::ptr::addr_of_mut!(self.init_executed)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
