@@ -109,15 +109,47 @@ GUEST_STATICLIB_CARGO_BUILD = $(if $(GUEST_STATICLIB_CRATE_TYPE_$(1)),$(subst ca
 # untouched, so integer/soft-float intrinsics keep their WEAK HIDDEN
 # semantics.
 #
-# Why a hardcoded list rather than autodiscovery: a "diff against
-# libm.a" approach needs libm.a available at the moment libposix.a is
-# built, which is awkward on developer setups (Windows hosts have no
-# i686-nanvix toolchain locally; libm.a lives only inside Docker images).
-# The 28 libm wrapper names below are C99 standard math symbols
-# (math.h public API) — newlib's libm has all of them, every other libm
+# Why a hardcoded list rather than autodiscovery: the 28 names below
+# are the C99 math.h public API. That contract is frozen — newlib's
+# libm has all of them, every other libm (glibc, musl, picolibc, ...)
 # has all of them, and the set has not changed in decades. Hardcoding
-# is robust here precisely because the contract being targeted is a
-# stable C99 specification.
+# against a stable specification is the most robust option here: the
+# list will not drift under us, and the localization step has no
+# build-time dependency on any other artifact.
+#
+# A "diff against libm.a" alternative was considered and rejected for
+# two reasons:
+#
+#   1. libm.a is not available at libposix.a build time in any of the
+#      build paths nanvix itself uses:
+#
+#        - Windows native (`z.ps1`, dev + CI `windows-latest`): no C
+#          cross-toolchain installed, libm.a does not exist on the host.
+#        - Linux native without `./z setup --nanvix-sdk`: same — newlib
+#          is only built when the SDK target is requested.
+#        - Linux CI (`ghcr.io/nanvix/ci:ubuntu-24.04`): the nanvix CI
+#          image carries the Rust toolchain only; no newlib, no libm.a.
+#
+#      libm.a only exists in the separate full-SDK Docker image
+#      (`nanvix/toolchain` / `ghcr.io/nanvix/toolchain-*`) that is
+#      consumed by downstream projects like cpython. Those projects
+#      link against the libposix.a we ship, but they build *after*
+#      libposix.a, so they cannot influence its localization step.
+#
+#   2. Even on a setup that does have libm.a available, introspecting
+#      it at libposix.a build time would couple two otherwise
+#      independent build stages and add machinery (locate libm.a, run
+#      `nm`, filter visibility — `nm`'s single-letter format does not
+#      distinguish HIDDEN from DEFAULT, so this needs care) without
+#      removing the need for a stable list as fallback. The
+#      cost/benefit does not justify the complexity.
+#
+# A proper long-term fix lives upstream in `compiler-builtins`: add a
+# target-spec field like `has-system-libm` to `i686-unknown-nanvix` so
+# the `full_availability` block in `src/math/mod.rs` is skipped at the
+# source. No such field exists today and no upstream PR is in flight;
+# until one lands, this post-build localization is the canonical
+# nanvix fix.
 #
 # Safety of localization: no Nanvix Rust no_std guest code calls these
 # C math symbols. `core`'s `f64::sqrt()` etc. lower to LLVM intrinsics
