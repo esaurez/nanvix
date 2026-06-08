@@ -14,6 +14,15 @@
 
 extern crate nvx;
 
+// Force `sys-ffi`'s `#[no_mangle]` kernel-call wrappers into the
+// `libposix.a` staticlib so C consumers (cpython's `_nanvixmodule.c`,
+// libposix's own C glue, port-library test ELFs) can resolve the
+// unmangled `__kcall_*` / `_do_exit_thread` / `__kcall_snapshot` names
+// at link time.  Without this `extern crate`, cargo metadata alone is
+// not enough to force a leaf crate with no `pub` re-exports to be
+// linked into the final staticlib.
+extern crate sys_ffi;
+
 extern crate alloc;
 
 #[cfg(feature = "syscall")]
